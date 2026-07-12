@@ -407,6 +407,8 @@ flowchart LR
 
 ### 5.4 和嵌入式 pthread 的对比（建立直觉）
 
+> 详细 VxWorks 对照见 [pthread-vs-embedded.md 第二节](pthread-vs-embedded.md#二vxworks-工程师专题taskspawn--semtake-与-pthread)。
+
 | 维度 | 嵌入式 RTOS Task | Redis pthread |
 |------|------------------|---------------|
 | 调度目标 | 确定性、可预测延迟 | 吞吐量、公平性 |
@@ -493,7 +495,8 @@ flowchart LR
 | Redis 持久化后台到底有几种机制？ | [rdb-aof-beginner-guide.md](rdb-aof-beginner-guide.md) | fork vs BIO 双机制、线程创建、资源回收全流程 |
 | 为什么要这样设计？谁负责什么？ | [rdb-aof-5w2h-analysis.md](rdb-aof-5w2h-analysis.md) | Why/What/When/Where/Who/Whom/How 完整分析 |
 | 怎么一步步读源码、动手验证？ | [rdb-aof-learning-roadmap.md](rdb-aof-learning-roadmap.md) | 6 阶段走读计划、gdb 断点、实验命令 |
-| pthread 和嵌入式多线程有何不同？ | [pthread-vs-embedded.md](pthread-vs-embedded.md) | futex、cond、epoll、调度、信号、False Sharing 等底层对照 |
+| 从初始化读 BIO，带注释导读？ | [bio-source-walkthrough.md](bio-source-walkthrough.md) | 启动链、逐函数注释、调用关系图、自检表 |
+| pthread 和嵌入式多线程有何不同？ | [pthread-vs-embedded.md](pthread-vs-embedded.md) | futex、cond、epoll、调度；**第二节 VxWorks taskSpawn/semTake 专题** |
 
 ### 推荐学习路径
 

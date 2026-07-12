@@ -1,6 +1,6 @@
 # pthread 与嵌入式多线程：底层原理对照
 
-> 建议先阅读 [00-introduction.md](00-introduction.md)。本文从**实现机制**出发，对比 Linux pthread 和典型 RTOS/裸机多任务，并穿插 Redis 里的实际用法，帮助嵌入式背景的读者建立「同一概念、不同实现」的映射。
+> 建议先阅读 [00-introduction.md](00-introduction.md)。本文从**实现机制**出发，对比 Linux pthread 和典型 RTOS/裸机多任务，并穿插 Redis 里的实际用法。**第二节**专为 VxWorks `taskSpawn`/`semTake` 背景读者编写，含用户态/内核态辨析与 FAQ。
 
 ---
 
@@ -48,7 +48,350 @@
 
 ---
 
-## 二、线程创建：底层发生了什么
+## 二、VxWorks 工程师专题：taskSpawn / semTake 与 pthread
+
+> 本节面向实际工程中使用 **`taskSpawn` + `semTake/semGive`** 的嵌入式开发者（典型于 VxWorks 及类似 RTOS），说明与 pthread 的差异、为何不能照搬、以及在 Redis 源码中如何「翻译」。
+
+### 2.1 你现在的模型 vs pthread 模型
+
+#### 嵌入式 RTOS 典型写法
+
+```c
+/* 创建任务 */
+taskId = taskSpawn("myTask", priority, VX_FP_TASK, stackSize,
+                   (FUNCPTR)taskFn, arg1, arg2, 0, 0, 0, 0, 0, 0, 0);
+
+/* 互斥（二值信号量） */
+semTake(mySem, WAIT_FOREVER);
+/* 临界区 */
+semGive(mySem);
+```
+
+| 概念 | 你的实现 | 本质 |
+|------|----------|------|
+| 执行单元 | `taskSpawn` 创建的 **Task** | 内核调度任务，固定优先级、固定栈 |
+| 互斥 | `semTake` / `semGive` | 信号量（二值或计数） |
+| 调度 | 固定优先级抢占 | 高优先级 Task 可立刻打断低优先级 |
+| 运行环境 | 裸机 / RTOS，通常**无 Linux** | 直接管理硬件 |
+
+#### Linux pthread 写法
+
+```c
+pthread_create(&tid, &attr, thread_fn, arg);
+
+pthread_mutex_lock(&mtx);
+/* 临界区 */
+pthread_mutex_unlock(&mtx);
+```
+
+| 概念 | pthread 实现 | 本质 |
+|------|--------------|------|
+| 执行单元 | `pthread_create` 创建的 **线程** | 跑在 Linux 内核之上，由 CFS 等调度 |
+| 互斥 | `pthread_mutex_lock/unlock` | 带**所有权**的互斥锁（底层常为 futex） |
+| 调度 | 公平调度，**非硬实时** | 不保证「X μs 内一定运行」 |
+| 运行环境 | **必须有 OS（通常 Linux）** | POSIX 用户态 API |
+
+```mermaid
+flowchart LR
+    subgraph rtos [RTOS世界_taskSpawn]
+        TS[taskSpawn指定prio和stack]
+        ST[semTake_semGive]
+        ISR2[ISR不可semTake]
+    end
+
+    subgraph linux [Linux世界_pthread]
+        PC[pthread_create]
+        PM[pthread_mutex]
+        EP[epoll事件循环]
+    end
+
+    TS -.->|概念类似但机制不同| PC
+    ST -.->|应类比mutex而非二值sem| PM
+```
+
+### 2.2 核心差异对照表
+
+| 维度 | `taskSpawn` + `semTake/Give` | `pthread` + `pthread_mutex` |
+|------|------------------------------|-----------------------------|
+| **所属世界** | RTOS 内核 API（VxWorks 等） | Linux POSIX 用户态 API |
+| **优先级** | 创建时显式指定（如 50、100） | 默认不设 RT 优先级，CFS 公平竞争 |
+| **栈** | 创建时指定（如 8KB、64KB） | 默认常 MB 级（虚拟内存按需映射） |
+| **创建开销** | 小，可估算 | 较大，涉及 `clone()`、TLS 等 |
+| **互斥语义** | 二值信号量**无严格所有权** | mutex **必须由加锁线程解锁** |
+| **优先级反转** | mutex 型 sem 常有继承/天花板 | 标准 Linux 默认 mutex **无**继承 |
+| **阻塞方式** | `semTake` 挂起当前 Task | 竞争失败 → futex 睡眠 |
+| **与中断关系** | ISR 里**不能** `semTake`（会阻塞） | 用户态无 ISR；中断由内核处理 |
+| **实时性** | 可硬实时（配合 RTOS） | 标准 Linux 为软实时 |
+
+### 2.3 semTake/semGive 和 pthread_mutex 差在哪？
+
+#### 信号量 ≠ 互斥锁（常见误区）
+
+用**二值信号量**当锁在 RTOS 里很常见，但与 mutex 有关键区别：
+
+| | 二值信号量 (`semTake/Give`) | 互斥锁 (`pthread_mutex` / `semMCreate`) |
+|---|---------------------------|----------------------------------------|
+| **所有权** | 谁 `Give` 都行，不必是 `Take` 的 Task | 必须**谁 lock 谁 unlock** |
+| **误用风险** | A 加锁、B 解锁 → 逻辑混乱 | 其他线程 unlock 会报错或未定义行为 |
+| **递归重入** | 一般不支持同 Task 重入 | 可配置 `PTHREAD_MUTEX_RECURSIVE` |
+| **优先级反转** | 普通二值 sem **不**解决 | RTOS mutex sem 常有优先级继承 |
+
+**工程含义**：
+
+- `semTake/Give` 更像「**通行证**」——谁都可以归还
+- `pthread_mutex` 更像「**带主人标签的锁**」——只有持有者能释放
+
+#### Redis 用的是 mutex + cond，不是信号量
+
+[src/bio.c](../src/bio.c) 中 BIO 线程模型：
+
+```c
+pthread_mutex_lock(&bio_mutex[j]);
+listAddNodeTail(bio_jobs[j], job);
+pthread_cond_signal(&bio_newjob_cond[j]);
+pthread_mutex_unlock(&bio_mutex[j]);
+```
+
+| 你的习惯 | Redis / pthread | 说明 |
+|----------|-----------------|------|
+| `semTake/Give` 保护队列 | `pthread_mutex` | 应类比 **mutex semaphore**（`semMCreate`），不是二值 sem |
+| `msgQSend/Receive` 阻塞收消息 | `pthread_cond_wait` + 自建队列 | cond 绑定 mutex，需防虚假唤醒（`while` 循环） |
+| 后台 Task 循环等活 | `bioProcessBackgroundJobs` | `cond_wait` → 取 job → 执行 → 循环 |
+
+### 2.4 taskSpawn 和 pthread_create 差在哪？
+
+#### 创建时你在指定什么
+
+```c
+// VxWorks：每个参数都很「嵌入式」
+taskSpawn(name, priority, VX_FP_TASK, stackSize, entry, arg1, ...);
+
+// pthread：很多用默认即可
+pthread_create(&tid, NULL, entry, arg);
+```
+
+| 创建时指定 | 为什么 RTOS 要指定 | pthread 为何不强调 |
+|------------|-------------------|-------------------|
+| **priority** | 硬实时，数字决定抢占顺序 | Linux 追求吞吐，不靠应用设 RT 优先级 |
+| **stackSize** | RAM 有限，必须事先估算 | 虚拟内存 + _guard page，默认很大 |
+| **options** | 浮点、分离栈等硬件相关 | 由 ABI / glibc 处理 |
+
+#### 调度行为差异（最关键）
+
+```
+RTOS (taskSpawn):
+  高优先级 Task 就绪 → 立刻抢占低优先级 Task
+
+Linux (pthread):
+  线程按 CFS vruntime 轮换 → 延迟不可严格保证
+```
+
+Redis **不设 RT 优先级**的原因：它是吞吐型服务，靠架构（主线程不阻塞、BIO offload）控制延迟，而非把 fsync 线程设为最高优先级。
+
+**Redis BIO 显式设置栈大小**（嵌入式工程师会感同身受）：
+
+```c
+#define REDIS_THREAD_STACK_SIZE (1024*1024*4)
+pthread_attr_setstacksize(&attr, stacksize);
+pthread_create(&thread, &attr, bioProcessBackgroundJobs, (void*) j);
+```
+
+#### 2.4.1 taskSpawn 能在「用户代码」里用吗？创建的是内核线程吗？
+
+这是 VxWorks 背景读者最常见的追问之一。
+
+**Q：应用代码（用户写的 `.c`）里可以正常调用 `taskSpawn` 吗？**
+
+| 环境 | 能否使用 `taskSpawn` |
+|------|---------------------|
+| **VxWorks 应用代码** | **可以**，这就是标准多任务创建方式 |
+| **VxWorks 6+ RTP（用户态进程）** | RTP 内可用，但与内核驱动任务有内存隔离 |
+| **嵌入式 Linux / 普通 Linux** | **不能**，无此 API，须用 `pthread_create` |
+
+注意：VxWorks 里的「用户代码」≠ Linux 里的「用户态」，后文说明。
+
+**Q：创建出来的是不是「内核态线程」？**
+
+部分正确，但不宜与 Linux 的「用户线程 / 内核线程」一一对应。更准确的说法是：
+
+> `taskSpawn` 通过**内核 API** 创建一个由 **wind 内核调度器管理的 Task**；  
+> 你的 `taskFn` 是普通 C 函数，但 TCB、栈、优先级等执行上下文由内核建立和维护。
+
+**VxWorks 模型（简化）**：
+
+```mermaid
+flowchart TB
+    subgraph app [你的应用代码]
+        TS[taskSpawn调用]
+    end
+
+    subgraph wind [VxWorks_wind内核]
+        TCB[任务控制块TCB]
+        Sched[固定优先级调度器]
+        Stack[任务栈]
+    end
+
+    TS -->|"内核API"| TCB
+    TCB --> Sched
+    TCB --> Stack
+    Sched -->|"调度执行"| Entry[你的taskFn入口函数]
+```
+
+**Linux pthread 模型（对比）**：
+
+```mermaid
+flowchart TB
+    subgraph user [用户态]
+        App[应用代码]
+        PthreadLib[glibc_pthread库]
+    end
+
+    subgraph kernel [内核态]
+        Clone[clone系统调用]
+        TaskStruct[task_struct]
+        CFS[CFS调度器]
+    end
+
+    App --> pthread_create
+    pthread_create --> PthreadLib
+    PthreadLib -->|"系统调用"| Clone
+    Clone --> TaskStruct
+    TaskStruct --> CFS
+```
+
+**关键差异**：
+
+| 维度 | VxWorks `taskSpawn` | Linux `pthread_create` |
+|------|---------------------|------------------------|
+| API 层次 | 内核/系统库 API，应用直接调用 | **用户态** glibc API |
+| 创建物 | wind **Task** | **pthread**（通常 1:1 内核线程） |
+| 地址空间 | 经典模式常与内核**共享平坦地址空间** | 用户态虚拟地址空间，syscall 进内核 |
+| 特权级 | 经典配置下应用 Task 常在 **supervisor 模式** | 应用代码在**用户态**，内核在内核态 |
+| 是否「内核线程」 | 由内核调度管理，**语义类似**内核线程 | 底层即内核 `task_struct` |
+
+**经典 VxWorks vs VxWorks 6+ RTP**：
+
+| 模式 | 说明 |
+|------|------|
+| **经典 VxWorks** | 应用与内核常同地址空间、同特权级，边界模糊；`taskSpawn` 不是「用户在用户态创建一个纯用户线程」 |
+| **VxWorks 6+ RTP** | 用户应用跑在 RTP（类似进程）里，有用户/内核隔离；`taskSpawn` 在 RTP 内创建的任务仍由 wind 内核调度 |
+
+**两句话总结**：
+
+1. **在 VxWorks 应用里**：`taskSpawn` 完全正常使用；在 **Linux 上不存在**此 API。
+2. **创建的是内核管理的 Task**，不是 Linux 意义上「用户态库自己 spawn 的轻量线程」；读 Redis 时把 `pthread_create` 当作「另一种 OS 下的任务创建」，但调度语义、栈、同步原语均不同。
+
+**与 Redis 的映射**：
+
+| 你的习惯 | Redis（Linux） |
+|----------|----------------|
+| `taskSpawn` 创建后台 I/O Task | `pthread_create` → BIO / IO worker |
+| `taskSpawn` 做重活（遍历写盘） | **`fork` 子进程**，不是 Task 也不是 pthread |
+| 应用里直接调内核 API 建 Task | 应用调 glibc → `clone()`  syscall 建线程 |
+
+### 2.5 为什么嵌入式往往不能直接用 pthread？
+
+不是 pthread 「不好」，而是**很多嵌入式场景根本没有 POSIX / Linux**。
+
+#### 三类典型环境
+
+| 环境 | 有没有 pthread | 常用 API |
+|------|----------------|----------|
+| **MCU 裸机 / FreeRTOS** | 无 | `xTaskCreate`、`xSemaphoreTake` |
+| **VxWorks / QNX 等 RTOS** | 部分支持 POSIX，但主推原生 API | `taskSpawn`、`semTake`、`semMCreate` |
+| **嵌入式 Linux（ARM Linux）** | **有** | `pthread`、`sem_open` 等 |
+
+#### 不用 pthread 的五条常见原因
+
+1. **没有 Linux 内核** — `pthread_create` 依赖 `clone()`、MMU、虚拟地址空间；STM32 等 MCU 上不存在
+2. **资源极其有限** — pthread 默认栈 + TLS + glibc 对 64KB RAM 的 MCU 不现实
+3. **需要硬实时** — 要求可分析 WCET；标准 Linux + pthread 做不到（除非 RT-Preempt）
+4. **启动链与确定性** — RTOS 从复位到 Task 运行路径短；Linux 因素多、难严格预测
+5. **历史与认证** — 航电、工控长期基于 VxWorks；换 pthread = 换整套 OS 栈，认证成本极高
+
+### 2.6 什么时候可以用 pthread？有什么坏处？
+
+#### 可以用：嵌入式 Linux
+
+板子跑 **Yocto / Buildroot / OpenWrt / ARM Linux** 时，可以且经常用 pthread，开发方式接近服务器端。
+
+Redis 本身就运行在这种环境（Linux 服务器），因此全面使用 pthread + fork。
+
+#### 强行使用 pthread 的坏处（即便在嵌入式 Linux 上）
+
+| 坏处 | 说明 |
+|------|------|
+| **栈默认过大** | glibc 默认 8MB 虚拟栈；须 `pthread_attr_setstacksize` 手动收紧 |
+| **延迟不可预测** | 页 fault、其他进程、内存分配器导致抖动 |
+| **优先级反转** | 默认 mutex 无继承，高优先级线程可能被间接阻塞 |
+| **调试更复杂** | 线程多、堆栈深、与内核交互多 |
+| **功耗更高** | 多线程 + 内核调度通常比 superloop 耗电 |
+| **移植性假象** | 代码依赖 pthread，换到无 Linux 的 MCU 立刻失效 |
+
+在**标准 Linux 服务器**（Redis 场景）上，这些代价通常可接受，换来标准 API 与 epoll/jemalloc 生态集成。
+
+### 2.7 VxWorks → pthread → Redis 翻译表
+
+| 你的习惯 (VxWorks) | Linux pthread | Redis 源码 |
+|--------------------|---------------|------------|
+| `taskSpawn(..., prio, stack, fn)` | `pthread_create` + 可选 `sched_param` | `bioInit()` → `pthread_create` |
+| 二值 `semTake/Give` 当锁 | **应改用** `pthread_mutex` | `bio_mutex[j]` |
+| `semMCreate` mutex sem | `pthread_mutex` | `bio_mutex[j]` |
+| `msgQSend` / `msgQReceive` | mutex + cond，或 pipe/eventfd | BIO：mutex+list+cond |
+| 高优先级 Task 做后台 I/O | 无直接等价；靠架构 offload | BIO worker1 做 fsync |
+| ISR 置 flag，主循环 poll | pipe/eventfd → epoll | `job_comp_pipe` 唤醒主线程 |
+| 双缓冲 / 内存快照 | `fork()` + COW | RDB / AOF Rewrite |
+| `taskDelay(n)` | `usleep` / `nanosleep`（不保证准时） | `serverCron` 定时检查 |
+| `taskDelete` | `pthread_cancel` / `pthread_join` | `bioKillThreads()`（极少路径） |
+
+### 2.8 常见问题 FAQ（读者追问汇总）
+
+**Q1：`semTake/semGive` 和 `pthread_mutex` 可以互换理解吗？**
+
+不可以。二值信号量当锁用时，应和 **`semMCreate`（mutex semaphore）** 或 **`pthread_mutex`** 对比。Redis [bio.c](../src/bio.c) 用的是后者，不是信号量。
+
+**Q2：为什么嵌入式不用 pthread，而用 `taskSpawn`？**
+
+- MCU / 经典 RTOS **没有 Linux/POSIX**，pthread 不存在
+- 需要**固定优先级、小栈、硬实时**，RTOS 原生 API 更合适
+- 既有项目（VxWorks 航电/工控）有认证与历史包袱
+
+**Q3：嵌入式 Linux 上能用 pthread 吗？有什么坏处？**
+
+能用。坏处包括：默认栈过大、延迟不可预测、无优先级继承、功耗更高、换到 MCU 无法移植。详见 [2.6 节](#26-什么时候可以用-pthread有什么坏处)。
+
+**Q4：`taskSpawn` 在用户代码里能用，是不是只创建了「内核线程」？**
+
+在 VxWorks 里应用代码调用 `taskSpawn` 是**正常用法**；创建的是**内核调度器管理的 Task**，经典模式下应用与内核边界与 Linux 不同。详见 [2.4.1 节](#241-taskspawn-能在用户代码里用吗创建的是内核线程吗)。
+
+**Q5：读 Redis 时如何快速映射自己的经验？**
+
+| 你的想法 | Redis 实际 |
+|----------|------------|
+| 再 `taskSpawn` 一个 Task 写 RDB | `fork()` 子进程 |
+| 低优先级 Task 做 fsync | BIO pthread worker1 |
+| `semTake` 保护队列 | `pthread_mutex` + `pthread_cond` |
+| ISR 通知主循环 | pipe/eventfd → epoll |
+
+**Q6：为什么不能把 Redis 的 pthread 代码直接搬到 VxWorks？**
+
+API 不同（无 `pthread_cond`、无 `fork`、无 `epoll`）、调度语义不同、持久化依赖 Linux COW 语义。需按 RTOS 能力重写同步与后台机制，而非简单替换函数名。
+
+### 2.9 本节结论（给 VxWorks 背景读者）
+
+1. **`taskSpawn` + `semTake/Give` 不是 pthread 的「低配版」**，而是 RTOS 世界另一套抽象，为**固定优先级、小栈、可预测性**而设计。
+
+2. **当锁用时**，应将 `semTake/Give` 与 **`semMCreate` / `pthread_mutex`** 对比，而不是与普通 counting sem 划等号。
+
+3. **MCU / VxWorks 上往往没有 pthread**；在**嵌入式 Linux** 上可以用，但需自行管理栈、实时性和优先级。
+
+4. **读 Redis 时**：BIO worker ≈ 一个没有固定 RT 优先级、用 **mutex+cond** 的后台 Task；RDB ≈ **fork 快照**，不是再 `taskSpawn` 一个写盘 Task。
+
+5. **`taskSpawn` 在 VxWorks 应用里正常可用**，创建的是内核管理的 Task；**Linux 上没有 `taskSpawn`**，Redis 用 `pthread_create` + `fork` 完成同类分工。
+
+---
+
+## 三、线程创建：底层发生了什么
 
 ### 嵌入式
 
@@ -96,7 +439,7 @@ pthread_attr_setstacksize(&attr, stacksize);
 
 ---
 
-## 三、互斥锁：底层实现完全不同
+## 四、互斥锁：底层实现完全不同
 
 ### 嵌入式 mutex / 关中断
 
@@ -161,7 +504,7 @@ Adaptive mutex：锁被持有时，等待者**自旋若干次**再 sleep——�
 
 ---
 
-## 四、条件变量：嵌入式里没有直接对应物
+## 五、条件变量：嵌入式里没有直接对应物
 
 ### pthread_cond
 
@@ -211,7 +554,7 @@ xQueueReceive(queue, &item, portMAX_DELAY);  // 消费者阻塞
 
 ---
 
-## 五、原子操作与内存屏障
+## 六、原子操作与内存屏障
 
 ### 嵌入式
 
@@ -258,7 +601,7 @@ __atomic_store_n(&var, value, __ATOMIC_SEQ_CST);
 
 ---
 
-## 六、并发模型：ISR vs 事件循环
+## 七、并发模型：ISR vs 事件循环
 
 这是嵌入式背景和 Linux 服务器背景**最大的思维差异**。
 
@@ -299,7 +642,7 @@ epoll_wait(...) → handleEventNotifier() → 处理队列
 
 ---
 
-## 七、信号（Signal）：嵌入式没有的东西
+## 八、信号（Signal）：嵌入式没有的东西
 
 Redis 多处用到信号：
 
@@ -328,7 +671,7 @@ syscall(SYS_tgkill, pid, tid, SIGUSR2);
 
 ---
 
-## 八、调度与实时性
+## 九、调度与实时性
 
 ### 嵌入式 RTOS
 
@@ -357,7 +700,7 @@ Thread A ──CFS 时间片/vruntime──> Thread B
 
 ---
 
-## 九、栈、TLS、线程局部存储
+## 十、栈、TLS、线程局部存储
 
 ### 嵌入式
 
@@ -374,7 +717,7 @@ Thread A ──CFS 时间片/vruntime──> Thread B
 
 ---
 
-## 十、多核与缓存：pthread 必须考虑、嵌入式单核可忽略
+## 十一、多核与缓存：pthread 必须考虑、嵌入式单核可忽略
 
 ### False Sharing（伪共享）
 
@@ -407,14 +750,14 @@ pthread_setaffinity_np(pthread_self(), ...);
 
 ---
 
-## 十一、概念对照总表
+## 十二、概念对照总表
 
-| 概念 | 嵌入式 | Linux pthread |
-|------|--------|---------------|
-| 执行单元 | Task / ISR | pthread / kernel thread |
-| 创建 | `xTaskCreate` | `pthread_create` → `clone()` |
-| 互斥 | 关中断 / mutex / spinlock | futex mutex |
-| 阻塞等待 | queue / semaphore | cond / futex / epoll |
+| 概念 | 嵌入式 (VxWorks/RTOS) | Linux pthread |
+|------|----------------------|---------------|
+| 执行单元 | Task (`taskSpawn`) / ISR | pthread / kernel thread |
+| 创建 | `taskSpawn(prio, stack, fn)` | `pthread_create` → `clone()` |
+| 互斥 | `semTake/Give` 或 `semMCreate` | futex mutex (`pthread_mutex`) |
+| 阻塞等待 | `msgQReceive` / `semTake` | cond / futex / epoll |
 | 异步通知 | ISR + flag | signal / eventfd / pipe |
 | 原子 | 关中断 + volatile / LDREX | C11 atomic / futex |
 | 调度 | 固定优先级 | CFS，公平非实时 |
@@ -425,17 +768,18 @@ pthread_setaffinity_np(pthread_self(), ...);
 
 ---
 
-## 十二、读 Redis 源码时的「翻译器」
+## 十三、读 Redis 源码时的「翻译器」
 
 当你看到 Redis 代码时，可以这样在脑子里翻译：
 
 | Redis 代码 | 嵌入式等价理解 |
 |------------|----------------|
-| `pthread_create` + worker loop | `xTaskCreate` + 后台 task |
-| `bioSubmitJob` + cond_signal | `xQueueSend` 唤醒 worker |
+| `pthread_create` + worker loop | `taskSpawn` + 后台 Task |
+| `bioSubmitJob` + cond_signal | `msgQSend` 或 semGive 唤醒 worker |
 | `job_comp_pipe` write | ISR 置 flag，通知主循环 |
 | `aeCreateFileEvent(pipe_fd)` | 主循环 `poll()` 里检查 flag |
-| `pthread_mutex_lock` 移动 list | 短临界区关调度/关中断 |
+| `pthread_mutex_lock` 移动 list | `semMCreate` / 短临界区 `semTake` |
+| `pthread_mutex`（非二值 sem） | **mutex semaphore**，不是普通 `semTake/Give` |
 | `atomicGetWithSync(t->running)` | 读 volatile flag + DMB |
 | `io_repl_ack_time` shadow copy | 双缓冲 / per-ISR 副本 |
 | `pthread_sigmask(SIG_BLOCK, SIGALRM)` | 某 task 屏蔽特定中断源 |
@@ -447,7 +791,7 @@ pthread_setaffinity_np(pthread_self(), ...);
 
 ---
 
-## 十三、核心结论
+## 十四、核心结论
 
 1. **pthread 不是「更高级的 RTOS task」**，而是跑在 **Linux 内核调度** 上的用户态线程，设计目标是**吞吐和编程便利性**，不是确定性延迟。
 
@@ -464,7 +808,7 @@ pthread_setaffinity_np(pthread_self(), ...);
 
 ---
 
-## 十四、与持久化学习的关联
+## 十五、与持久化学习的关联
 
 本对照文档为 [rdb-aof-beginner-guide.md](rdb-aof-beginner-guide.md) 和 [rdb-aof-learning-roadmap.md](rdb-aof-learning-roadmap.md) 提供底层背景：
 

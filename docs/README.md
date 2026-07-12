@@ -9,10 +9,11 @@
 | 顺序 | 文档 | 回答什么问题 |
 |------|------|--------------|
 | **0** | [00-introduction.md](00-introduction.md) | Redis 是什么？**项目框架**？**系统架构图**？用在哪？学习目标？ |
-| **0b** | [pthread-vs-embedded.md](pthread-vs-embedded.md) | pthread 与嵌入式多线程的底层原理对照（futex、cond、epoll、调度） |
+| **0b** | [pthread-vs-embedded.md](pthread-vs-embedded.md) | pthread 与嵌入式对照；**含 VxWorks `taskSpawn`/`semTake` 专题** |
 | **1** | [rdb-aof-beginner-guide.md](rdb-aof-beginner-guide.md) | 持久化后台有哪两种机制？线程/进程如何创建与回收？ |
 | **2** | [rdb-aof-5w2h-analysis.md](rdb-aof-5w2h-analysis.md) | 从 Why/What/When/Where/Who/Whom/How 分析设计决策 |
 | **3** | [rdb-aof-learning-roadmap.md](rdb-aof-learning-roadmap.md) | 如何分阶段走读源码、动手验证？ |
+| **3b** | [bio-source-walkthrough.md](bio-source-walkthrough.md) | **BIO 专题**：初始化链 + 带注释导读 + 调用关系图 |
 
 ```mermaid
 flowchart LR
@@ -21,8 +22,9 @@ flowchart LR
     guide["01 初学者指南\n概念建立"]
     analysis["02 5W2H分析\n设计理解"]
     roadmap["03 学习路线\n源码实践"]
+    bio["03b BIO导读\n注释+关系图"]
 
-    intro --> pthread --> guide --> analysis --> roadmap
+    intro --> pthread --> guide --> analysis --> roadmap --> bio
 ```
 
 ---

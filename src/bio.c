@@ -128,6 +128,8 @@ void bioInit(void) {
     unsigned long j;
 
     /* Initialization of state vars and objects */
+    // 创建三个线程： 1、close 线程 - 用来在后台close（fd）， 必要是会先 fsync； 2。 aof（append only file）线程， 用来存储redis 相关指令， 便于回放。
+    // 3、 懒释放， 释放大内存是 CPU 占有率比较高， 耗时长， 会从主线程移动到bio中。先逻辑删除， 然后由该县城实时真实的物理删除。
     for (j = 0; j < BIO_WORKER_NUM; j++) {
         pthread_mutex_init(&bio_mutex[j],NULL);
         pthread_cond_init(&bio_newjob_cond[j],NULL);

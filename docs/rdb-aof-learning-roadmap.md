@@ -66,18 +66,51 @@ flowchart TB
 
 ## 阶段 1：BIO 线程 — pthread 唯一入口（约 1–2 天）
 
+> **详细导读（带注释 + 调用关系图）**：[bio-source-walkthrough.md](bio-source-walkthrough.md)  
+> 本节为概要；完整五阶段走读、逐函数注释、时序图见该文档。
+
 **Why**：`fsync()`、`close()` 大文件可能阻塞毫秒~秒级，不能放在主事件循环。
 
-### 走读顺序
+### 五阶段走读路线
 
-| 步骤 | 函数 | 文件:行号 | 要回答的问题 |
-|------|------|-----------|--------------|
-| 1 | `InitServerLast()` | server.c:2881 | BIO 何时创建？ |
-| 2 | `bioInit()` | bio.c:124 | mutex/cond/队列/pipe 怎么初始化？ |
-| 3 | `bioProcessBackgroundJobs()` | bio.c | worker 如何 `cond_wait` → 执行 → 回收 job？ |
-| 4 | `bioCreateFsyncJob()` | bio.c:244 | 主线程如何提交 AOF fsync 任务？ |
-| 5 | BIO_AOF_FSYNC 分支 | bio.c:312 附近 | fsync 完成后更新了哪些 atomic 状态？ |
-| 6 | `bioPipeReadJobCompList` | bio.c | pipe 如何把 BIO 完成事件桥接进 ae 事件循环？ |
+```mermaid
+flowchart TD
+    P0["0_预备\nbio.h + DESIGN"]
+    P1["1_启动链\nmain → bioInit"]
+    P2["2_BIO内核\nSubmit → Worker"]
+    P3["3_完成通知\npipe → ae"]
+    P4["4_业务调用\naof / bg_unlink"]
+    P5["5_gdb验证"]
+
+    P0 --> P1 --> P2 --> P3 --> P4 --> P5
+```
+
+### 走读顺序（概要表）
+
+| 阶段 | 步骤 | 函数 | 文件:行号 | 要回答的问题 |
+|------|------|------|-----------|--------------|
+| 0 | 1 | `bio.h` + DESIGN | bio.c:1–36 | 几个 worker？几种 job？ |
+| 1 | 2 | `main()` → `initServer()` | server.c:6909, 2592 | ae 事件循环何时创建？ |
+| 1 | 3 | `InitServerLast()` → `bioInit()` | server.c:2881, bio.c:124 | BIO 为何放在最后创建？ |
+| 2 | 4 | `bioSubmitJob()` | bio.c:178 | 生产者：lock→入队→signal？ |
+| 2 | 5 | `bioProcessBackgroundJobs()` | bio.c:253 | 消费者：cond_wait→执行→回收？ |
+| 2 | 6 | `bioCreateFsyncJob()` | bio.c:244 | AOF fsync 如何提交？ |
+| 3 | 7 | `bioPipeReadJobCompList()` | bio.c:412 | pipe 如何桥接 ae 事件循环？ |
+| 4 | 8 | `flushAppendOnlyFile()` → `aof_background_fsync()` | aof.c:1045, 905 | everysec 完整链路？ |
+| 4 | 9 | `bioDrainWorker()` | bio.c:377, aof.c:2463 | Rewrite 前为何排空 fsync？ |
+| 4 | 10 | `bg_unlink()` → `bioCreateCloseJob()` | replication.c:78 | 删文件为何还要 BIO close？ |
+
+### 启动链关键顺序（必记）
+
+```
+initServer()           → 创建 server.el（ae）、记录 main_thread_id
+    ↓
+InitServerLast()
+    → bioInit()        → ★ 3 个 BIO pthread + pipe 注册到 ae
+    → initThreadedIO()
+    ↓
+aeMain()               → 主循环；pipe 可读时调用 bioPipeReadJobCompList
+```
 
 ### 三个 worker 职责
 
@@ -104,11 +137,15 @@ redis-cli INFO persistence   # 看 aof_last_fsync 等字段
 
 ### gdb 断点建议
 
-- `bioInit` — 确认 3 个线程创建
-- `bioCreateFsyncJob` — 确认 everysec 路径提交任务
-- `bioProcessBackgroundJobs` — 观察 worker 取任务
+按此顺序下断点、跟一次完整 fsync 路径（详见 [bio-source-walkthrough.md 第七节](bio-source-walkthrough.md#七阶段-5动手验证)）：
 
-**阶段产出**：手绘 BIO 生产者-消费者图 + 标注 mutex/cond/pipe 各自保护/通知什么。
+1. `bioInit` — 确认 3 个线程创建
+2. `bioCreateFsyncJob` — 确认 everysec 路径提交任务
+3. `bioSubmitJob` — 观察入队与 cond_signal
+4. `bioProcessBackgroundJobs` — 观察 worker 取任务与 fsync
+5. `bioPipeReadJobCompList` — 若有 completion job
+
+**阶段产出**：手绘 BIO 生产者-消费者图 + 标注 mutex/cond/pipe 各自保护/通知什么；完成 [bio-source-walkthrough.md](bio-source-walkthrough.md) 第七节自检表。
 
 ---
 
