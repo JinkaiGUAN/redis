@@ -74,7 +74,8 @@ char *replicationGetSlaveName(client *c) {
  * background thread instead. We actually just do close() in the thread,
  * by using the fact that if there is another instance of the same file open,
  * the foreground unlink() will only remove the fs name, and deleting the
- * file's storage space will only happen once the last reference is lost. */
+ * file's storage space will only happen once the last reference is lost.
+ * 【导读】unlink 删文件名，bioCreateCloseJob 在 worker0 中 close(fd) 释放 inode。 */
 int bg_unlink(const char *filename) {
     int fd = open(filename,O_RDONLY|O_NONBLOCK);
     if (fd == -1) {
@@ -92,6 +93,7 @@ int bg_unlink(const char *filename) {
             errno = old_errno;
             return -1;
         }
+        /* 【导读】交给 BIO worker0 close，真正释放 inode 存储空间 */
         bioCreateCloseJob(fd, 0, 0);
         return 0; /* Success. */
     }

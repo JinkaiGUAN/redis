@@ -55,6 +55,7 @@ static char* bio_worker_title[] = {
 
 #define BIO_WORKER_NUM (sizeof(bio_worker_title) / sizeof(*bio_worker_title))
 
+/* 【导读】每种 job 路由到固定 worker；AOF fsync 与 close 共用 worker1，保证同 fd 操作顺序。 */
 static unsigned int bio_job_to_worker[] = {
     [BIO_CLOSE_FILE] = 0,
     [BIO_AOF_FSYNC] = 1,
@@ -71,9 +72,7 @@ static pthread_cond_t bio_newjob_cond[BIO_WORKER_NUM];
 static list *bio_jobs[BIO_WORKER_NUM];
 static unsigned long bio_jobs_counter[BIO_NUM_OPS] = {0};
 
-/* The bio_comp_list is used to hold completion job responses and to handover
- * to main thread to callback as notification for job completion. Main
- * thread will be triggered to read the list by signaling via writing to a pipe */
+/* 【导读】completion 回调队列；通过 job_comp_pipe 唤醒主线程 ae 事件循环。 */
 static list *bio_comp_list;
 static pthread_mutex_t bio_mutex_comp;
 static int job_comp_pipe[2];   /* Pipe used to awake the event loop */
@@ -120,16 +119,21 @@ void bioPipeReadJobCompList(aeEventLoop *el, int fd, void *privdata, int mask);
  * main thread. */
 #define REDIS_THREAD_STACK_SIZE (1024*1024*4)
 
-/* Initialize the background system, spawning the thread. */
+/* Initialize the background system, spawning the thread.
+ *
+ * 【导读】由 InitServerLast() 调用（见 server.c），进程生命周期内创建 3 个常驻 pthread：
+ *   worker0 (bio_close_file)：bg_unlink 等场景的后台 close。
+ *   worker1 (bio_aof)：AOF fsync / close-AOF（appendfsync everysec）。
+ *   worker2 (bio_lazy_free)：大对象/大库 lazyfree。
+ * 主线程通过 bioSubmitJob() 提交任务；worker 执行 bioProcessBackgroundJobs()。
+ * 完成回调经 job_comp_pipe 唤醒 ae（bioPipeReadJobCompList），不能用 cond 唤醒主线程（主线程在 epoll_wait 中）。 */
 void bioInit(void) {
     pthread_attr_t attr;
     pthread_t thread;
     size_t stacksize;
     unsigned long j;
 
-    /* Initialization of state vars and objects */
-    // 创建三个线程： 1、close 线程 - 用来在后台close（fd）， 必要是会先 fsync； 2。 aof（append only file）线程， 用来存储redis 相关指令， 便于回放。
-    // 3、 懒释放， 释放大内存是 CPU 占有率比较高， 耗时长， 会从主线程移动到bio中。先逻辑删除， 然后由该县城实时真实的物理删除。
+    /* 【导读】每个 worker 一套 mutex + cond + FIFO 队列（生产者-消费者）。 */
     for (j = 0; j < BIO_WORKER_NUM; j++) {
         pthread_mutex_init(&bio_mutex[j],NULL);
         pthread_cond_init(&bio_newjob_cond[j],NULL);
@@ -151,13 +155,13 @@ void bioInit(void) {
         exit(1);
     }
 
-    /* Register a readable event for the pipe used to awake the event loop on job completion */
+    /* 【导读】将 pipe 注册到 initServer() 创建的 server.el；BIO 写 pipe，aeMain 分发 bioPipeReadJobCompList。 */
     if (aeCreateFileEvent(server.el, job_comp_pipe[0], AE_READABLE,
                           bioPipeReadJobCompList, NULL) == AE_ERR) {
         serverPanic("Error registering the readable event for the bio pipe.");
     }
 
-    /* Set the stack size as by default it may be small in some system */
+    /* 【导读】lazyfree 等路径调用栈较深，需扩大线程栈（默认 4MB）。 */
     pthread_attr_init(&attr);
     pthread_attr_getstacksize(&attr,&stacksize);
     if (!stacksize) stacksize = 1; /* The world is full of Solaris Fixes */
@@ -177,6 +181,7 @@ void bioInit(void) {
     }
 }
 
+/* 【导读】主线程生产者：入队并 cond_signal 唤醒 worker；仅由本文件 bioCreate* 调用。 */
 void bioSubmitJob(int type, bio_job *job) {
     job->header.type = type;
     unsigned long worker = bio_job_to_worker[type];
@@ -187,6 +192,7 @@ void bioSubmitJob(int type, bio_job *job) {
     pthread_mutex_unlock(&bio_mutex[worker]);
 }
 
+/* 【导读】大 key/DB 删除 offload 到 worker2；调用方见 lazyfree.c。 */
 void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...) {
     va_list valist;
     /* Allocate memory for the job structure and all required
@@ -202,6 +208,7 @@ void bioCreateLazyFreeJob(lazy_free_fn free_fn, int arg_count, ...) {
     bioSubmitJob(BIO_LAZY_FREE, job);
 }
 
+/* 【导读】提交 completion 请求：worker 完成后经 pipe 在主线程执行 comp_fn（如 FLUSHALL 异步通知）。 */
 void bioCreateCompRq(bio_worker_t assigned_worker, comp_fn *func, uint64_t user_data) {
     int type;
     switch (assigned_worker) {
@@ -224,6 +231,7 @@ void bioCreateCompRq(bio_worker_t assigned_worker, comp_fn *func, uint64_t user_
     bioSubmitJob(type, job);
 }
 
+/* 【导读】后台 close 交给 worker0；典型调用：bg_unlink() 在 unlink 之后。 */
 void bioCreateCloseJob(int fd, int need_fsync, int need_reclaim_cache) {
     bio_job *job = zmalloc(sizeof(*job));
     job->fd_args.fd = fd;
@@ -233,6 +241,7 @@ void bioCreateCloseJob(int fd, int need_fsync, int need_reclaim_cache) {
     bioSubmitJob(BIO_CLOSE_FILE, job);
 }
 
+/* 【导读】AOF 轮转时 fsync+close，与 BIO_AOF_FSYNC 同 worker1 保证顺序。 */
 void bioCreateCloseAofJob(int fd, long long offset, int need_reclaim_cache) {
     bio_job *job = zmalloc(sizeof(*job));
     job->fd_args.fd = fd;
@@ -243,6 +252,7 @@ void bioCreateCloseAofJob(int fd, long long offset, int need_reclaim_cache) {
     bioSubmitJob(BIO_CLOSE_AOF, job);
 }
 
+/* 【导读】提交 AOF fsync 到 worker1；appendfsync everysec 时由 aof_background_fsync 调用；主线程已完成 write()。 */
 void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache) {
     bio_job *job = zmalloc(sizeof(*job));
     job->fd_args.fd = fd;
@@ -252,6 +262,7 @@ void bioCreateFsyncJob(int fd, long long offset, int need_reclaim_cache) {
     bioSubmitJob(BIO_AOF_FSYNC, job);
 }
 
+/* 【导读】BIO worker 入口：消费者循环。仅在等待/操作队列时持锁；fsync/close/lazyfree 等慢操作在锁外执行。 */
 void *bioProcessBackgroundJobs(void *arg) {
     bio_job *job;
     unsigned long worker = (unsigned long) arg;
@@ -286,8 +297,7 @@ void *bioProcessBackgroundJobs(void *arg) {
         /* Get the job from the queue. */
         ln = listFirst(bio_jobs[worker]);
         job = ln->value;
-        /* It is now possible to unlock the background system as we know have
-         * a stand alone job structure to process.*/
+        /* 【导读】执行慢 I/O 前释放锁，允许主线程继续提交 job。 */
         pthread_mutex_unlock(&bio_mutex[worker]);
 
         /* Process the job accordingly to its type. */
@@ -323,6 +333,7 @@ void *bioProcessBackgroundJobs(void *arg) {
                 }
             } else {
                 atomicSet(server.aof_bio_fsync_status,C_OK);
+                /* 【导读】主线程读取（WAITAOF、复制等）。 */
                 atomicSet(server.fsynced_reploff_pending, job->fd_args.offset);
             }
 
@@ -342,7 +353,7 @@ void *bioProcessBackgroundJobs(void *arg) {
             comp_rsp->func = job->comp_rq.fn;
             comp_rsp->arg = job->comp_rq.arg;
 
-            /* just write it to completion job responses */
+            /* 【导读】写入 completion 列表，再 write(pipe) 唤醒主线程 ae。 */
             pthread_mutex_lock(&bio_mutex_comp);
             listAddNodeTail(bio_comp_list, comp_rsp);
             pthread_mutex_unlock(&bio_mutex_comp);
@@ -360,11 +371,12 @@ void *bioProcessBackgroundJobs(void *arg) {
         pthread_mutex_lock(&bio_mutex[worker]);
         listDelNode(bio_jobs[worker], ln);
         bio_jobs_counter[job_type]--;
+        /* 【导读】唤醒 bioDrainWorker() 中等待队列清空的主线程。 */
         pthread_cond_signal(&bio_newjob_cond[worker]);
     }
 }
 
-/* Return the number of pending jobs of the specified type. */
+/* 【导读】供 aofFsyncInProgress() 等判断 BIO fsync 是否仍在队列中。 */
 unsigned long bioPendingJobsOfType(int type) {
     unsigned int worker = bio_job_to_worker[type];
 
@@ -375,7 +387,8 @@ unsigned long bioPendingJobsOfType(int type) {
     return val;
 }
 
-/* Wait for the job queue of the worker for jobs of specified type to become empty. */
+/* Wait until a worker queue has no pending jobs of any type routed to it.
+ * 【导读】主线程在 AOF rewrite 等场景调用，等待 worker 队列排空（如 bioDrainWorker(BIO_AOF_FSYNC)）。 */
 void bioDrainWorker(int job_type) {
     unsigned long worker = bio_job_to_worker[job_type];
 
@@ -409,6 +422,8 @@ void bioKillThreads(void) {
     }
 }
 
+/* 【导读】ae 可读事件：BIO worker 写 pipe 后，主线程批量执行 comp_fn。
+ * 不能用 pthread_cond 唤醒主线程，因其阻塞在 aeMain/epoll_wait 中。 */
 void bioPipeReadJobCompList(aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(mask);

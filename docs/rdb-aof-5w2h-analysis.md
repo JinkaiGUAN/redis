@@ -11,6 +11,32 @@
 
 ---
 
+## 术语表（阅读前先扫一眼）
+
+| 术语 / 缩写 | 中文含义 | 本文中的用法 |
+|-------------|----------|--------------|
+| **5W2H** | Why / What / When / Where / Who / Whom / How | 下文分析框架：从动机到实现一路拆开 |
+| **RDB** | Redis Database（快照文件） | 内存数据的二进制快照；由 fork 子进程执行 BGSAVE 落盘 |
+| **AOF** | Append Only File（追加日志） | 把写命令追加到日志文件，用于重启恢复 |
+| **BGSAVE** | Background Save | 后台触发 RDB 保存的命令 / 路径 |
+| **BGREWRITEAOF** | Background Rewrite AOF | 后台触发 AOF 重写的命令 / 路径 |
+| **Rewrite** | AOF 重写 | 把膨胀的命令历史压缩成「当前数据集」的等价 AOF |
+| **BASE AOF** | 基准 AOF 文件 | Rewrite 完成后作为基线的 AOF |
+| **INCR AOF** | 增量 AOF 文件 | Rewrite 期间父进程继续写入的增量日志 |
+| **appendfsync** | AOF 刷盘策略配置 | `always` / `everysec` / `no`，决定何时 `fsync` |
+| **BIO** | Background I/O（后台 I/O） | 启动时创建的常驻 pthread worker：fsync、close、lazyfree |
+| **pthread** | POSIX 线程 | BIO 使用的线程模型（不是 fork 子进程） |
+| **fork** | 创建子进程 | RDB / AOF Rewrite 用 OS `fork()` 拿内存快照 |
+| **COW** | Copy-On-Write（写时复制） | fork 后父子共享页；谁先写谁拷贝，实现低成本快照 |
+| **lazyfree** | 惰性释放 | 大对象 / 大库在 BIO 线程异步释放内存 |
+| **bg_unlink** | 后台删文件 | 先 unlink 文件名，再把慢 `close` 丢给 BIO |
+| **fsync** | 强制刷盘 | 把已 write 的数据推到持久化存储；everysec 时常走 BIO |
+| **fd** | File Descriptor（文件描述符） | 打开文件的句柄；AOF 有 `aof_fd` 等 |
+| **waitpid** | 等待子进程结束 | 父进程回收 fork 子进程并读退出状态 |
+| **QPS** | Queries Per Second | 每秒请求数；主线程阻塞时延迟会飙升 |
+
+---
+
 ## 一、先建立一张「地图」
 
 ```mermaid
@@ -38,6 +64,99 @@ flowchart LR
 |------|----------|----------|----------|
 | **fork 子进程** | `redisFork()` | 临时，干完就 exit | 写 RDB、AOF Rewrite |
 | **BIO 线程** | `bioInit()` → `pthread_create` × 3 | 进程启动后常驻 | AOF fsync、文件 close、lazyfree |
+
+### 读图时常见疑问：fork 子进程究竟是什么关系？
+
+地图里写了「fork 子进程」和「主线程」，很容易默认成「主线程的一个子线程」。下面三个问题按阅读顺序澄清。
+
+#### Q：子进程与主线程是什么关系？
+
+**不是线程父子，而是进程父子。** 主线程只是**父进程**里负责发号施令和最后 `waitpid` 回收的那条执行流。
+
+| 对比 | BIO 线程 | fork 子进程 |
+|------|----------|-------------|
+| 与主线程关系 | **同进程**内的兄弟线程，共享地址空间 | **父子进程**，各自独立 PID |
+| 内存 | 真共享，一边改另一边看得见 | fork 瞬间逻辑视图相同；靠 **COW** 共享物理页，谁写谁拷贝 |
+| 生命周期 | 启动常驻 | 干完 `_exit`，父进程 `waitpid` 回收 |
+| 协作方式 | 任务队列 + 条件变量 / pipe | 子进程写临时文件；父进程看退出码做 rename / 清理 |
+
+```mermaid
+sequenceDiagram
+    participant Main as 父进程主线程
+    participant Child as fork子进程
+    participant Disk as 磁盘
+
+    Main->>Main: redisFork()
+    Note over Main,Child: 此刻父子内存视图相同<br/>之后靠 COW 分离
+
+    par 父进程继续服务
+        Main->>Main: 处理客户端命令
+        Main->>Main: 正常写 AOF buffer 等
+    and 子进程只干重活
+        Child->>Disk: 遍历快照写 temp 文件
+        Child->>Child: _exit
+    end
+
+    Main->>Main: serverCron 到 waitpid
+    Main->>Disk: rename 或失败清理
+    Main->>Main: resetChildState
+```
+
+两层概念不要混：
+
+1. **进程层**：父进程 ↔ 子进程（`fork` 的直接产物）
+2. **线程层**：父进程里还有主线程 + BIO 等 pthread；子进程里通常只继续跑调用了 `fork` 的那条路径，BIO 不会在子进程里继续跑业务
+
+一句话：**BIO 是帮主线程干慢 I/O 的同事；fork 子进程是被派出写快照、写完就下班的临时工。**
+
+#### Q：是每次有任务都 fork 再消除，还是单独常驻一个进程处理？
+
+**是第一种：按次 fork，干完就退出。** 不是单独常驻一个 fork 出来的进程一直等任务。
+
+```text
+无任务：  只有父进程（主线程 + BIO 等），child_pid = -1
+
+有任务：  BGSAVE / BGREWRITEAOF / …
+            → redisFork()          // 新 PID
+            → 子进程：改标题 → 写盘 → exitFromChild() / _exit()
+            → 父进程：记下 child_pid，继续服务
+            → serverCron → waitpid → handler → resetChildState()
+            → 又变成「没有子进程」
+
+下次任务：再 redisFork() 一次，又是一个新 PID
+```
+
+源码形态（RDB）：`redisFork(CHILD_TYPE_RDB) == 0` 进入子进程分支 → `rdbSave(...)` → 退出。AOF Rewrite 同理。子进程用 `_exit()`（经 `exitFromChild`），避免跑完整 `exit()` 清理误伤父进程还要用的资源。
+
+| | fork 子进程 | BIO |
+|--|-------------|-----|
+| 创建次数 | **每次** BGSAVE / Rewrite 等才创建 | 启动时 `bioInit()` **一次**建 3 个 |
+| 退出 | 任务结束即 `_exit` | 常驻到 Redis 进程退出 |
+| 排队 | 同一时刻通常**最多一个**互斥类子进程 | 任务丢进队列，worker 反复取 |
+
+#### Q：这种 fork 不会抬升 CPU 占用率吗？
+
+**会，但要分清：抬升主要不是「fork 这一下」，而是子进程在干活的那段时间。** Redis 用短时脉冲换「主线程不被锁死」。
+
+| 阶段 | 对 CPU 的影响 | 量级直觉 |
+|------|----------------|----------|
+| `fork()` 本身 | 主要是页表 / 元数据，**不会立刻拷贝整库内存** | 通常短促；大库仍可能有一次尖峰 |
+| 子进程跑起来 | 遍历键空间、序列化、`write` 临时文件 | **这段最明显**：等于多出一个忙于写盘的进程 |
+| COW 缺页 | 父进程在 BGSAVE 期间改内存页 → 整页拷贝 | CPU + 内存带宽一起涨；写越多越重 |
+| 父进程主线程 | 仍在处理命令 | 自身 CPU 不一定更高，但整机争用会上去 |
+
+常见现象：`BGSAVE` / `BGREWRITEAOF` 期间 `INFO` 里 `used_cpu_*_children` 起来；主线程延迟可能因争用略差，但仍远好于「主线程自己同步写整库」。
+
+为什么还敢每次 fork：
+
+- **间歇性**：任务结束子进程就退出，不是常驻打满一核
+- **互斥**：同一时刻基本只允许一个这类子进程
+- **换的是延迟**：重活挪出主事件循环
+- **对比常态 fsync**：高频短任务走 BIO，就是怕每次都 fork 受不了
+
+运维上可观察 `rdb_last_cow_size` 等 cow 指标；也可把子进程绑到非主业务核（`bgsave_cpulist` / `aof_rewrite_cpulist`），并把 save / auto-aof-rewrite 错峰。
+
+**结论**：CPU 抬升是预期代价；目标不是「零 CPU」，而是别堵死响应命令的主线程，并把抬升限制成短时、可调度、互斥的脉冲。
 
 ---
 
@@ -396,6 +515,15 @@ A：`INFO persistence` 看 `rdb_last_bgsave_status`；或日志 `Background savi
 
 **Q6：SIGUSR1 是干什么的？**  
 A：主动取消子进程的信号，handler 里不算错误。
+
+**Q7：fork 子进程和主线程是什么关系？**  
+A：是**父子进程**，不是主线程的子线程。主线程在父进程里发号施令并 `waitpid`；子进程写临时文件后 `_exit`。详细对照见「一、地图」下「读图时常见疑问」。
+
+**Q8：fork 是每次任务新建再消除，还是常驻一个子进程？**  
+A：**每次** BGSAVE / BGREWRITEAOF 等才 `redisFork()` 一次，干完就退出；下次再 fork 出新 PID。常驻的是 BIO，不是 fork 子进程。
+
+**Q9：频繁 / 每次 fork 会不会抬高 CPU？**  
+A：会。尖峰主要来自**子进程遍历写盘**以及期间的 **COW 缺页**，不是单单 `fork()` 调用本身。这是用短时 CPU 脉冲换主线程不被锁死；可错峰、看 cow 指标、给子进程绑核。
 
 ---
 

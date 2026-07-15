@@ -1,7 +1,9 @@
 # BIO 源码导读：从 Redis 初始化到后台 I/O 线程
 
 > 本文是 [rdb-aof-learning-roadmap.md](rdb-aof-learning-roadmap.md) **阶段 1** 的详细展开。  
-> 建议配合 [pthread-vs-embedded.md](pthread-vs-embedded.md) 第二节阅读（mutex+cond 与 `taskSpawn`/`semTake` 对照）。
+> 建议配合 [pthread-vs-embedded.md](pthread-vs-embedded.md) 第二节阅读（mutex+cond 与 `taskSpawn`/`semTake` 对照）。  
+> **导读注释已同步写入源码**：`src/bio.c`、`src/bio.h`、`src/server.c`、`src/aof.c`、`src/replication.c`、`src/lazyfree.c`。  
+> 学习用注释统一为 **中文 `【导读】` 前缀**，与 Redis 原有英文注释区分。
 
 ---
 
@@ -16,54 +18,100 @@ flowchart TD
     P2["阶段2_BIO内核\nSubmit → Worker"]
     P3["阶段3_完成通知\npipe → ae"]
     P4["阶段4_业务调用\naof / bg_unlink"]
-    P5["阶段5_动手验证\ngdb"]
+    P5["阶段5_动手验证\nCLion/gdb"]
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5
 ```
 
-### 1.2 全局调用关系图
+### 1.2 全局关系图（时序优先）
+
+> **读图要点**：时间轴从上到下。整条链都由**主线程**编排：先创建 BIO，再进 `aeMain`；AOF 入口是主线程循环里的业务调用，不是另起线程。
+
+#### 1.2.1 启动期：主线程创建 BIO，再进入事件循环
 
 ```mermaid
-flowchart TB
-    subgraph boot [启动_主线程]
-        main["main()"]
-        initSrv["initServer()"]
-        initLast["InitServerLast()"]
-        bioInit["bioInit()"]
-        aeMain["aeMain()"]
-    end
+sequenceDiagram
+    autonumber
+    participant Main as 主线程
+    participant Init as initServer
+    participant Last as InitServerLast
+    participant BIO as bioInit
+    participant W0 as BIO_worker0
+    participant W1 as BIO_worker1_aof
+    participant W2 as BIO_worker2
+    participant AE as aeMain
 
-    subgraph bio_workers [BIO_worker线程x3]
-        worker["bioProcessBackgroundJobs()"]
-    end
-
-    subgraph producers [主线程提交job]
-        fsync["bioCreateFsyncJob()"]
-        close["bioCreateCloseJob()"]
-        lazy["bioCreateLazyFreeJob()"]
-        submit["bioSubmitJob()"]
-    end
-
-    subgraph aof_path [AOF持久化入口]
-        flush["flushAppendOnlyFile()"]
-        aofBg["aof_background_fsync()"]
-        drain["bioDrainWorker()"]
-    end
-
-    subgraph notify [完成通知]
-        pipeW["write(job_comp_pipe)"]
-        pipeR["bioPipeReadJobCompList()"]
-        cb["comp_fn回调"]
-    end
-
-    main --> initSrv --> initLast --> bioInit
-    bioInit -->|"pthread_create x3"| worker
-    initLast --> aeMain
-    flush --> aofBg --> fsync --> submit
-    submit -->|"cond_signal"| worker
-    worker --> pipeW --> pipeR --> cb
-    aeMain --> pipeR
+    Main->>Init: 创建 server.el / DB / main_thread_id
+    Note over Main,Init: 此时尚无 BIO 线程
+    Main->>Last: 模块与 listener 就绪后
+    Last->>BIO: bioInit()
+    BIO->>W0: pthread_create
+    BIO->>W1: pthread_create
+    BIO->>W2: pthread_create
+    Note over W0,W2: 三个常驻 worker 阻塞在 cond_wait
+    Main->>Main: loadDataFromDisk（7.4：BIO 已存在）
+    Main->>AE: 进入事件循环（此后运行期）
 ```
+
+#### 1.2.2 运行期：主线程驱动 AOF，再把 fsync 交给 BIO
+
+以 `appendfsync everysec` 为例（时间关系最清晰）：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Cli as 客户端
+    participant Main as 主线程_aeMain
+    participant Sleep as beforeSleep
+    participant AOF as flushAppendOnlyFile
+    participant Bg as aof_background_fsync
+    participant Sub as bioSubmitJob
+    participant W1 as BIO_worker1_aof
+
+    Cli->>Main: SET key value
+    Main->>Main: 改内存 + 追加 aof_buf
+    Note over Main: 事件处理结束后准备 sleep
+    Main->>Sleep: beforeSleep()
+    Sleep->>AOF: flushAppendOnlyFile(0)
+    AOF->>AOF: write(aof_fd)  【主线程完成写盘缓冲】
+    alt 距上次 fsync ≥ 1s 且无进行中的 fsync
+        AOF->>Bg: aof_background_fsync(fd)
+        Bg->>Sub: bioCreateFsyncJob → bioSubmitJob
+        Sub->>W1: lock → 入队 → cond_signal
+        Note over Main,Sleep: 主线程立即返回，不阻塞在 fsync
+        W1->>W1: redis_fsync(fd)  【慢 I/O 在 worker】
+        W1->>W1: 更新 fsynced_reploff_pending
+    else always 策略或其他路径
+        AOF->>AOF: 主线程直接 redis_fsync（不经 BIO）
+    end
+    Main->>Main: epoll_wait 等待下一轮事件
+```
+
+#### 1.2.3 结构总览（谁调用谁，对照上面时序）
+
+```mermaid
+flowchart LR
+    subgraph boot [启动期]
+        main["main"] --> initSrv["initServer"]
+        initSrv --> initLast["InitServerLast"]
+        initLast --> bioInit["bioInit"]
+        bioInit -->|"pthread_create×3"| worker["BIO workers"]
+        initLast --> aeMain["aeMain"]
+    end
+
+    subgraph runtime [运行期_主线程]
+        aeMain --> beforeSleep["beforeSleep"]
+        beforeSleep --> flush["flushAppendOnlyFile"]
+        flush -->|"everysec"| fsyncJob["bioCreateFsyncJob"]
+        fsyncJob -->|"cond_signal"| worker
+        worker -->|"pipe 可读"| pipeR["bioPipeReadJobCompList"]
+        aeMain --> pipeR
+    end
+```
+
+对照：1.2.1 / 1.2.2 看**先后顺序**；1.2.3 看**静态调用边**。AOF 挂在 `aeMain → beforeSleep` 下，与「主线程负责启动与调度」一致。
+
+更多「为何曾漏画这条边 / ae 与 comp list 是什么」见 [十、常见疑问（FAQ）](#十常见疑问faq)。
 
 ### 1.3 精简阅读清单（可打印勾选）
 
@@ -134,20 +182,24 @@ void bioDrainWorker(int job_type);               // 阻塞直到某类 job 全�
 
 ### 3.1 启动时序
 
+（与 [1.2.1](#121-启动期主线程创建-bio再进入事件循环) 相同逻辑；此处保留便于阶段 1 独立阅读。）
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant M as main_主线程
     participant IS as initServer
-    participant LD as loadDataFromDisk
     participant IL as InitServerLast
     participant BI as bioInit
+    participant LD as loadDataFromDisk
     participant AE as aeMain
 
     M->>IS: 创建ae事件循环_DB_记录main_thread_id
     Note over M,IS: 此时尚无BIO线程
-    M->>LD: 加载RDB或AOF
     M->>IL: 模块加载_listener就绪后
     IL->>BI: pthread_create x3
+    Note over BI: 三个 BIO worker 已常驻
+    M->>LD: 加载RDB或AOF（7.4：BIO已存在）
     M->>AE: 进入事件循环
 ```
 
@@ -183,10 +235,14 @@ void initServer(void) {
     ThreadsManager_init();           // 【导读】IO 线程信号协调，与 BIO 独立
     server.main_thread_id = pthread_self();  // 【导读】后续可用 pthread_equal 判断是否主线程
 
-    server.el = aeCreateEventLoop(...);      // 【导读】★ bioInit 要把 pipe 注册到这个事件循环上
+    server.el = aeCreateEventLoop(...);      // 【导读】★ 创建主线程事件循环「空架子」；bioInit 要把 pipe 注册到其上
     // ... 创建 DB、客户端列表等 ...
+    aeCreateTimeEvent(server.el, 1, serverCron, ...);  // 【导读】时间事件：约每 1ms 跑 serverCron
+    aeSetBeforeSleepProc(server.el, beforeSleep);      // 【导读】每轮 epoll 前：含 flushAppendOnlyFile
 }
 ```
+
+> **易混点**：名字是 **Event** Loop（事件循环），不是「时间循环」。其中既有 **文件事件**（fd 可读可写），也有 **时间事件**（定时回调）。详见 [十、常见疑问 Q2–Q3](#十常见疑问faq)。
 
 ### 3.4 InitServerLast()（[server.c:2881](../src/server.c)）
 
@@ -271,6 +327,8 @@ void bioSubmitJob(int type, bio_job *job) {
 ```
 
 **调用者**：仅 `bioCreate*` 系列函数（主线程路径），worker 自己不调用。
+
+> **常见疑问**：为何入队不检查容量、一直 `listAdd`？——BIO 队列有意无界；反压在调用方（如 AOF 的 `aofFsyncInProgress`）。详见 [十、常见疑问 Q4](#十常见疑问faq)。
 
 ### 4.4 bioCreateFsyncJob() — 持久化最常用入口（[bio.c:244](../src/bio.c)）
 
@@ -366,6 +424,16 @@ pthread_cond_signal(主线程)  ✗  主线程不在 cond_wait 上
 write(pipe) → epoll 可读       ✓  集成进现有事件循环
 ```
 
+`bioInit` 里成套创建的是：
+
+| 对象 | 角色 |
+|------|------|
+| `BIO_COMP_RQ_*` job | 挂在 **worker 的 bio_jobs** 上，FIFO 栅栏：「排到我 = 前面的活做完了」 |
+| `bio_comp_list` | 跨线程的 **回调载荷**（`func` + `arg`） |
+| `job_comp_pipe` | 只负责 **叫醒** 主线程 ae，本身不带业务数据 |
+
+> 普通 AOF fsync **不走** comp list（用 atomic 汇报）；显式 `bioCreateCompRq`（如 FLUSHALL ASYNC）才进 list。详见 [十、常见疑问 Q5](#十常见疑问faq)。
+
 ### 5.2 bioPipeReadJobCompList()（[bio.c:412](../src/bio.c)）
 
 ```c
@@ -409,19 +477,25 @@ sequenceDiagram
 
 ### 6.1 AOF everysec fsync 全链路
 
+（总览见 [1.2.2](#122-运行期主线程驱动-aof再把-fsync-交给-bio)；本节强调业务副作用。）
+
 ```mermaid
 sequenceDiagram
+    autonumber
     participant C as 客户端
     participant M as 主线程
+    participant Sleep as beforeSleep
     participant AOF as aof.c
     participant BIO as bio_aof_worker
 
     C->>M: SET key value
     M->>M: 修改内存 + 追加aof_buf
-    M->>AOF: flushAppendOnlyFile()
+    M->>Sleep: beforeSleep()
+    Sleep->>AOF: flushAppendOnlyFile()
     AOF->>AOF: write(aof_fd) 主线程
     AOF->>AOF: aof_background_fsync()
     AOF->>BIO: bioCreateFsyncJob → bioSubmitJob
+    Note over M: 主线程不等 fsync，继续 ae 循环
     BIO->>BIO: redis_fsync()
     BIO->>BIO: atomicSet(fsynced_reploff_pending)
 ```
@@ -457,14 +531,159 @@ bioCreateCloseJob(fd, 0, 0);       // 【导读】BIO worker0：close(fd) 真正
 
 ## 七、阶段 5：动手验证
 
-### 7.1 编译与启动
+推荐优先用 **CLion 图形界面** 跟 BIO 调用链（线程、调用栈、变量一目了然）；命令行 gdb 作为备选。
+
+### 7.1 编译与命令行启动（备选）
 
 ```bash
 make CFLAGS="-g -O0"
 ./src/redis-server --appendonly yes --appendfsync everysec
 ```
 
-### 7.2 gdb 推荐断点顺序
+### 7.2 CLion 交互式调试（推荐）
+
+Redis 主工程是 **Makefile**，不是顶层 CMake。CLion 用「打开目录 + Makefile/Compilation Database + Custom Build Target」即可交互调试。
+
+#### 7.2.1 打开工程与索引源码
+
+1. **File → Open**，选择仓库根目录（含 `Makefile`、`src/`）。
+2. 若提示项目模型：选 **Makefile**，或沿用已有 `.idea`（本仓库可能已关联 CompDB）。
+3. 首次打开等索引完成；之后可在源码中搜索 `【导读】`、对函数名跳转定义。
+
+生成 Compilation Database（改善跳转/补全，可选）：
+
+```bash
+# 需已安装 bear，或用 compiledb 等工具
+make clean
+bear -- make CFLAGS="-g -O0" -j
+# 生成 compile_commands.json 后，CLion 可 File → Open 或 reload CompDB
+```
+
+也可只保证 Debug 编译（与仓库 External Tool 一致）：
+
+```bash
+make OPTIMIZATION=-O0 MALLOC=libc redis-server
+```
+
+产物：`src/redis-server`（带符号，可下断点）。
+
+#### 7.2.2 配置 Custom Build Target（一键编译）
+
+本仓库已有参考配置（可直接复用或对照新建）：
+
+- `.idea/customTargets.xml` → target 名 `redis-server-debug`
+- `.idea/tools/External Tools.xml` → `redis-build` / `redis-clean`
+
+当前 `redis-build` 等价命令：
+
+```bash
+make OPTIMIZATION=-O0 MALLOC=libc redis-server
+```
+
+（`OPTIMIZATION=-O0` 便于单步；`MALLOC=libc` 减少 jemalloc 干扰调试。）
+
+若需手建：
+
+1. **Settings → Tools → External Tools** → `+`
+   - Name：`redis-build`
+   - Program：`/usr/bin/make`（或 `make`）
+   - Arguments：`OPTIMIZATION=-O0 MALLOC=libc redis-server`
+   - Working directory：`$ProjectFileDir$`
+2. **Settings → Build, Execution, Deployment → Custom Build Targets** → `+`
+   - Name：`redis-server-debug`
+   - Build：选上面的 `redis-build`
+   - Clean：可选 `make distclean` / `redis-clean`
+
+#### 7.2.3 配置 Run/Debug Configuration
+
+1. 右上角 **Add Configuration…** → **Native Application**（或 **Custom Build Application**，若 Build 已绑 Custom Target）
+2. 建议字段：
+
+| 项 | 建议值 |
+|----|--------|
+| Name | `redis-server BIO` |
+| Target / Executable | `$ProjectFileDir$/src/redis-server` |
+| Program arguments | `--appendonly yes --appendfsync everysec --port 6379` |
+| Working directory | `$ProjectFileDir$` |
+| Before launch | Build `redis-server-debug`（或先手动 `make`） |
+
+可选：`--dir /tmp/redis-bio-debug`，避免污染仓库目录下的 dump/AOF。
+
+macOS 若 LLDB 附加受限：在 **System Settings → Privacy & Security → Developer Tools** 允许终端/CLion，或以调试签名运行（按本机策略）。
+
+#### 7.2.4 交互界面：断点与线程
+
+推荐断点（行号以本地为准，用符号搜索最快）：
+
+| 顺序 | 文件 | 符号 | 看什么 |
+|------|------|------|--------|
+| 1 | `bio.c` | `bioInit` | 三个 `pthread_create`，`job_comp_pipe` 注册到 `server.el` |
+| 2 | `aof.c` | `aof_background_fsync` | everysec 是否进 BIO |
+| 3 | `bio.c` | `bioCreateFsyncJob` | offset、fd |
+| 4 | `bio.c` | `bioSubmitJob` | `worker` 下标、入队后 `cond_signal` |
+| 5 | `bio.c` | `bioProcessBackgroundJobs` | 哪个 worker、是否 `BIO_AOF_FSYNC` |
+| 6 | `bio.c` | `bioPipeReadJobCompList` | 仅 completion 路径才会进（如 FLUSHALL ASYNC） |
+
+操作要点：
+
+1. 源码行号左侧点击红色断点（或光标处 `⌘F8` / `Ctrl+F8`）。
+2. 点绿色虫子图标 **Debug**（不要只 Run）。
+3. 进程停在 `bioInit` 后，打开：
+   - **Debugger → Frames**：调用栈（谁调用了当前函数）
+   - **Threads**：主线程 vs `bio_aof` / `bio_close_file` / `bio_lazy_free`
+   - **Variables**：`worker`、`job`、`type` 等
+4. **F8** Step Over、**F7** Step Into、**⇧F8** Step Out；Resume（`⌥⌘R` / `F9`）继续跑到下一断点。
+5. 另开终端触发路径（Debug 时 Redis 已在跑）：
+
+```bash
+./src/redis-cli -p 6379 SET foo bar
+# 或加压更容易在 1s 窗口内撞到 fsync：
+./src/redis-benchmark -p 6379 -t set -n 1000 -q
+```
+
+#### 7.2.5 跟 BIO 时建议观察的界面
+
+```mermaid
+flowchart LR
+  subgraph clion [CLion_Debug窗口]
+    bp[断点列表]
+    frames[Frames调用栈]
+    threads[Threads线程列表]
+    vars[Variables]
+  end
+  subgraph flow [跟读顺序]
+    init[bioInit]
+    submit[bioSubmitJob]
+    worker[bioProcessBackgroundJobs]
+  end
+  bp --> init --> submit --> worker
+  threads -->|"切换到 bio_aof"| worker
+  frames -->|"确认主线程提交"| submit
+```
+
+| 界面 | 用法 |
+|------|------|
+| **Threads** | 停在 `bioProcessBackgroundJobs` 时切到 `bio_aof` 线程，确认 fsync 不在主线程 |
+| **Frames** | 在 `bioSubmitJob` 上看上层是否 `aof_background_fsync` ← `flushAppendOnlyFile` ← `beforeSleep` |
+| **Variables / Watches** | 监视 `bio_jobs_counter`、`job->header.type`、`server.aof_fsync` |
+| **LLDB/GDB console** | Debug 窗口下方可敲 `p worker`、`p *job` 等（视工具链） |
+
+**注意**：`bioProcessBackgroundJobs` 是死循环，第一次进入可能停在 `cond_wait`；应用写入触发 fsync 后，再 Resume 或在 `redis_fsync`/`BIO_AOF_FSYNC` 分支处下断，避免一直卡在等待。
+
+#### 7.2.6 与命令行 gdb 的对应关系
+
+| CLion | gdb 等价 |
+|-------|----------|
+| 行断点 | `break bioSubmitJob` |
+| Debug 启动 | `gdb --args ./src/redis-server ...` + `run` |
+| Threads 面板 | `info threads` / `thread N` |
+| Frames | `bt` |
+| Variables | `p var` |
+| Resume / Step | `c` / `n` / `s` |
+
+只会命令行时可看下一小节；日常学 BIO **优先 CLion**。
+
+### 7.3 gdb 推荐断点顺序（命令行备选）
 
 ```gdb
 break bioInit
@@ -477,7 +696,7 @@ run
 
 在另一个终端：`redis-cli SET foo bar` 或 `redis-benchmark -t set -n 1000 -q`
 
-### 7.3 每遍阅读的自检问题
+### 7.4 每遍阅读的自检问题
 
 | 遍次 | 问题 | 答案要点 |
 |------|------|----------|
@@ -486,6 +705,9 @@ run
 | 第 3 遍 | fsync 在哪个 worker？ | worker1 `bio_aof` |
 | 第 4 遍 | 主线程如何被唤醒？ | `job_comp_pipe` → `ae` 可读 → `bioPipeReadJobCompList` |
 | 第 5 遍 | Rewrite 前为何 drain？ | 等旧 AOF 的 fsync 全部完成，防 repl offset 竞态 |
+| 第 6 遍 | AOF 与主线程如何关联？ | `aeMain → beforeSleep → flushAppendOnlyFile`（见 FAQ Q1） |
+| 第 7 遍 | Submit 为何不限队列深度？ | 无界 list；反压在调用方（见 FAQ Q4） |
+| 第 8 遍 | CLion 里如何确认 fsync 在 BIO？ | Threads 切到 `bio_aof`，Frames 不在主线程 `aeMain` |
 
 ---
 
@@ -503,6 +725,167 @@ run
 | `bioDrainWorker` | 同步等待 | `rewriteAppendOnlyFileBackground` | `cond_wait` |
 | `bioPendingJobsOfType` | 查询队列深度 | `aofFsyncInProgress` 等 | — |
 | `bioKillThreads` | 强制结束 | `debug.c`（crash） | `pthread_cancel` |
+
+---
+
+## 九、源码 `【导读】` 注释索引
+
+> 在 IDE 中全局搜索 `【导读】` 可快速定位所有学习注释。
+
+| 文件 | 关键位置 | 导读要点 |
+|------|----------|----------|
+| `src/bio.h` | `bio_worker_t` 枚举 | 三个 worker 分工 |
+| `src/bio.h` | `bioInit` / `bioCreate*` API | 对外接口一览 |
+| `src/bio.c` | `bio_job_to_worker[]` | job 路由规则 |
+| `src/bio.c` | `bioInit()` | 创建 3 个 pthread、注册 pipe |
+| `src/bio.c` | `bioSubmitJob()` | 生产者入队 |
+| `src/bio.c` | `bioProcessBackgroundJobs()` | worker 消费者循环 |
+| `src/bio.c` | `bioPipeReadJobCompList()` | pipe 唤醒主线程 ae |
+| `src/bio.c` | `bioDrainWorker()` | rewrite 前排空 fsync |
+| `src/server.c` | `initServer()` | 主线程 ID、创建 `server.el` |
+| `src/server.c` | `InitServerLast()` | `bioInit` + `initThreadedIO` |
+| `src/server.c` | `main()` | 启动顺序、`loadDataFromDisk` 时机 |
+| `src/server.c` | `aeMain()` | 主循环处理 job_comp_pipe |
+| `src/aof.c` | `aof_background_fsync()` | everysec 后台 fsync |
+| `src/aof.c` | `flushAppendOnlyFile()` everysec 分支 | 提交 fsync job |
+| `src/aof.c` | `rewriteAppendOnlyFileBackground()` | fork rewrite 与 drain |
+| `src/replication.c` | `bg_unlink()` | unlink + BIO close |
+| `src/lazyfree.c` | `freeObjAsync()` | 大 key 异步释放 |
+
+---
+
+## 十、常见疑问（FAQ）
+
+> 本节汇总导读中的典型疑问与结论，与正文时序图互补。
+
+### Q1：全局关系图里，主线程和 AOF 入口为何曾「看起来没关联」？
+
+**疑问**：主线程应负责启动与调度，AOF 不该像一条独立启动链。
+
+**结论**：原图把**启动期**与**运行期**拆开画时，漏了运行期边。实际上：
+
+1. **启动**：主线程 `main → InitServerLast → bioInit`，一次性 `pthread_create` 出 3 个 BIO worker。
+2. **运行**：主线程在 `aeMain` 里，每轮 `beforeSleep()` → `flushAppendOnlyFile()`；`everysec` 再 `aof_background_fsync → bioCreateFsyncJob`。
+
+AOF 不是另起线程，而是主线程事件循环里的业务调用；BIO 只是已创建的 worker。正确画法见 [1.2](#12-全局关系图时序优先)。
+
+---
+
+### Q2：`aeMain` 是什么流程？
+
+**结论**：Redis **主线程事件循环**。启动结束后主线程几乎一直待在这里：
+
+```c
+void aeMain(aeEventLoop *eventLoop) {
+    while (!eventLoop->stop) {
+        aeProcessEvents(...);  // beforeSleep → epoll_wait → 文件/时间事件回调
+    }
+}
+```
+
+每轮要点：
+
+1. `beforeSleep`（含 AOF flush、写回客户端等）
+2. `aeApiPoll`（epoll/kqueue 阻塞）
+3. 文件事件回调（客户端、`job_comp_pipe` 等）
+4. 时间事件（`serverCron`）
+
+**嵌入式对照**：不是再 `taskSpawn` 一个主循环任务，而是主线程自己 `while(1)` 在 mux 上等待——类似「一个任务挂多个事件源」。**调度中枢是 `aeMain`，BIO 只是后台 worker。**
+
+---
+
+### Q3：`initServer` 里的 `aeCreateEventLoop` 有何作用？「时间」如何理解？后续怎么用？
+
+**结论**：创建的是 **Event Loop（事件循环）对象** `server.el`，此时**还不跑循环**，只造好「空架子」。
+
+| 概念 | 含义 | Redis 例子 |
+|------|------|------------|
+| **文件事件** | fd 可读/可写时调回调 | 客户端连接、`job_comp_pipe`、监听口 |
+| **时间事件** | 过 N 毫秒调一次 | `aeCreateTimeEvent(..., 1, serverCron)` |
+| **epoll 超时** | poll 最长睡多久 | 睡到下一时间事件，或有 fd 就绪 |
+
+后续挂载与运转：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Init as initServer
+    participant EL as server.el
+    participant Bio as bioInit
+    participant Main as aeMain
+
+    Init->>EL: aeCreateEventLoop（空架子）
+    Init->>EL: TimeEvent→serverCron；BeforeSleep→beforeSleep
+    Note over Init,EL: 尚未进入循环
+    Bio->>EL: FileEvent→job_comp_pipe
+    Main->>EL: aeMain 真正 while 调度
+```
+
+所以必须先有 `aeCreateEventLoop`，`bioInit` 才能把 pipe 注册上去；最后 `aeMain(server.el)` 才开始调度。
+
+---
+
+### Q4：`bioSubmitJob` 作为生产者，为何不检查 job 数量是否超出规格，而是一直添加？
+
+**结论**：有意做成**无界 FIFO**；限流不在 Submit 层。
+
+原因简述：
+
+1. **职责薄**：只保证入队 + 唤醒 + 同 worker FIFO。满时该丢/阻塞/报错？三类 job 语义不同，通用 API 难统一。
+2. **正常负载稀**：healthy 时 everysec 大约每秒 1 个 fsync；不像 RTOS 高频 `msgQSend` 要硬顶 `maxMsgs`。
+3. **主线程不能被 BIO 堵死**：若队列满就在 Submit 里 `cond_wait`，慢盘会反压回事件循环，违背 BIO 初衷。
+
+反压在**调用方**：
+
+| 路径 | 做法 |
+|------|------|
+| AOF everysec | 已有 pending fsync 时不再提交（`!sync_in_progress`） |
+| AOF write | fsync 未完成可推迟 write 最多约 2s |
+| 淘汰 | 可短等 `bioPendingJobsOfType(BIO_LAZY_FREE)` |
+| 运维 | `INFO` 的 `aof_pending_bio_fsync` |
+
+极端堆积靠监控/内存暴露，而不是 Submit 返回 full。
+
+| | VxWorks `msgQ` | Redis BIO |
+|--|----------------|-----------|
+| 队列 | 常有 `maxMsgs` | 无界 `list` |
+| 满时策略 | 阻塞 / 超时 / 丢 | 不在 Submit 定义 |
+| 安全阀 | 队列深度 | 调用方节流 + 内存/变慢 |
+
+---
+
+### Q5：`bioInit` 里创建的 `bio_comp_list`（comp list）作用是什么？
+
+**结论**：BIO 做完后，若回调**必须回主线程**执行，就用这条队列投递；与 pipe 成套。
+
+主线程堵在 `epoll_wait`，不能用 `pthread_cond` 唤醒。普通 fsync/close/lazyfree 做完多半只改 atomic 或释放内存；需要「等 worker 上前面 job 清完再在主线程做事」时：
+
+1. `bioCreateCompRq` → 往该 worker 塞 `BIO_COMP_RQ_*`（FIFO 栅栏）
+2. worker 赶到它 → 前面已做完
+3. 回调写入 `bio_comp_list`，`write(job_comp_pipe)` 叫醒 ae
+4. 主线程 `bioPipeReadJobCompList` 取表执行 `comp_fn`
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Main as 主线程
+    participant W as BIO_worker
+    participant Comp as bio_comp_list
+    participant Pipe as job_comp_pipe
+
+    Main->>W: 真实 job（如 lazyfree）
+    Main->>W: bioCreateCompRq（排在后面）
+    W->>W: FIFO 做完真实 job，再处理 COMP_RQ
+    W->>Comp: listAdd(func, arg)
+    W->>Pipe: write("A")
+    Pipe->>Main: epoll 可读
+    Main->>Comp: 取走整表，执行 func(arg)
+```
+
+典型：`FLUSHALL` blocking async（[db.c](../src/db.c)）在 lazyfree worker 上挂 `flushallSyncBgDone`。  
+**everysec 的 `bioCreateFsyncJob` 一般不走 comp list**，靠 `fsynced_reploff_pending` 等 atomic。
+
+**一句话**：`bio_comp_list` = 回调载荷；`pipe` = 叫醒信号；`BIO_COMP_RQ_*` = worker 队列上的完成栅栏。
 
 ---
 

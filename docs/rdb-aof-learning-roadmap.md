@@ -137,7 +137,7 @@ redis-cli INFO persistence   # 看 aof_last_fsync 等字段
 
 ### gdb 断点建议
 
-按此顺序下断点、跟一次完整 fsync 路径（详见 [bio-source-walkthrough.md 第七节](bio-source-walkthrough.md#七阶段-5动手验证)）：
+按此顺序下断点、跟一次完整 fsync 路径（详见 [bio-source-walkthrough.md 第七节](bio-source-walkthrough.md#七阶段-5动手验证)；**推荐 CLion 图形调试** 见该节 7.2）：
 
 1. `bioInit` — 确认 3 个线程创建
 2. `bioCreateFsyncJob` — 确认 everysec 路径提交任务

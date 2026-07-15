@@ -901,7 +901,8 @@ int aofFsyncInProgress(void) {
 }
 
 /* Starts a background task that performs fsync() against the specified
- * file descriptor (the one of the AOF file) in another thread. */
+ * file descriptor (the one of the AOF file) in another thread.
+ * 【导读】appendfsync everysec 时由 flushAppendOnlyFile 调用；主线程已 write()，worker1 执行 fsync。 */
 void aof_background_fsync(int fd) {
     bioCreateFsyncJob(fd, server.master_repl_offset, 1);
 }
@@ -1245,6 +1246,7 @@ try_fsync:
     } else if (server.aof_fsync == AOF_FSYNC_EVERYSEC &&
                server.mstime - server.aof_last_fsync >= 1000) {
         if (!sync_in_progress) {
+            /* 【导读】主线程已 write()；提交 bioCreateFsyncJob 到 BIO worker1 */
             aof_background_fsync(server.aof_fd);
             server.aof_last_incr_fsync_offset = server.aof_last_incr_size;
         }
@@ -2433,6 +2435,7 @@ werr:
  *    4d) persist AOF manifest file
  *    4e) Delete the history files use bio
  */
+/* 【导读】AOF 后台 rewrite：fork 前 flush、开新 INCR AOF；必要时 bioDrainWorker 排空 fsync。 */
 int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 

@@ -2595,7 +2595,7 @@ void initServer(void) {
     signal(SIGHUP, SIG_IGN);
     signal(SIGPIPE, SIG_IGN);
     setupSignalHandlers();
-    ThreadsManager_init();
+    ThreadsManager_init(); /* 【导读】IO 线程信号协调，与 BIO 独立 */
     makeThreadKillable();
 
     if (server.syslog_enabled) {
@@ -2609,7 +2609,7 @@ void initServer(void) {
     server.hz = server.config_hz;
     server.pid = getpid();
     server.in_fork_child = CHILD_TYPE_NONE;
-    server.main_thread_id = pthread_self();
+    server.main_thread_id = pthread_self(); /* 【导读】用于区分主线程与 BIO/IO 线程 */
     server.current_client = NULL;
     server.errors = raxNew();
     server.errors_enabled = 1;
@@ -2655,6 +2655,7 @@ void initServer(void) {
     adjustOpenFilesLimit();
     const char *clk_msg = monotonicInit();
     serverLog(LL_NOTICE, "monotonic clock: %s", clk_msg);
+    /* 【导读】主线程事件循环：命令、客户端、BIO job_comp_pipe 均挂在此 ae 上 */
     server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
     if (server.el == NULL) {
         serverLog(LL_WARNING,
@@ -2879,8 +2880,8 @@ void initListeners(void) {
  * Thread Local Storage initialization collides with dlopen call.
  * see: https://sourceware.org/bugzilla/show_bug.cgi?id=19329 */
 void InitServerLast(void) {
-    bioInit();
-    initThreadedIO();
+    bioInit(); /* 【导读】创建 3 个常驻 BIO pthread，详见 bio.c */
+    initThreadedIO(); /* 【导读】网络 IO 线程，与 BIO 分工不同 */
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
     server.initial_memory_usage = zmalloc_used_memory();
 }
@@ -7178,7 +7179,7 @@ int main(int argc, char **argv) {
         serverLog(LL_NOTICE, "Configuration loaded");
     }
 
-    initServer();
+    initServer(); /* 【导读】创建 server.el、DB 等；此时尚无 BIO 线程 */
     if (background || server.pidfile) createPidFile();
     if (server.set_proc_title) redisSetProcTitle(NULL);
     redisAsciiArt();
@@ -7195,13 +7196,14 @@ int main(int argc, char **argv) {
     if (server.cluster_enabled) {
         clusterInitLast();
     }
+    /* 【导读】BIO/IO 线程在此启动（需 server.el 已存在）；晚于模块加载，避免 TLS/dlopen 竞态 */
     InitServerLast();
 
     if (!server.sentinel_mode) {
         /* Things not needed when running in Sentinel mode. */
         serverLog(LL_NOTICE,"Server initialized");
         aofLoadManifestFromDisk();
-        loadDataFromDisk();
+        loadDataFromDisk(); /* 【导读】7.4：在 InitServerLast 之后，BIO 已存在 */
         aofOpenIfNeededOnServerStart();
         aofDelHistoryFiles();
         if (server.cluster_enabled) {
@@ -7240,7 +7242,7 @@ int main(int argc, char **argv) {
     redisSetCpuAffinity(server.server_cpulist);
     setOOMScoreAdj(-1);
 
-    aeMain(server.el);
+    aeMain(server.el); /* 【导读】主循环；job_comp_pipe 可读时调用 bioPipeReadJobCompList */
     aeDeleteEventLoop(server.el);
     return 0;
 }
