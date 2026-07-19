@@ -12,8 +12,8 @@
 | **0b** | [pthread-vs-embedded.md](pthread-vs-embedded.md) | pthread 与嵌入式对照；**含 VxWorks `taskSpawn`/`semTake` 专题** |
 | **1** | [rdb-aof-beginner-guide.md](rdb-aof-beginner-guide.md) | 持久化后台有哪两种机制？线程/进程如何创建与回收？ |
 | **2** | [rdb-aof-5w2h-analysis.md](rdb-aof-5w2h-analysis.md) | 从 Why/What/When/Where/Who/Whom/How 分析设计决策 |
-| **3** | [rdb-aof-learning-roadmap.md](rdb-aof-learning-roadmap.md) | 如何分阶段走读源码、动手验证？ |
-| **3b** | [bio-source-walkthrough.md](bio-source-walkthrough.md) | **BIO 专题**：初始化链 + 导读注释 + 时序图 + **CLion 交互调试** |
+| **3** | [rdb-aof-learning-roadmap.md](rdb-aof-learning-roadmap.md) | 分阶段走读 + 命令行实验；**阶段 1 含固化短答与细节** |
+| **3b** | [bio-source-walkthrough.md](bio-source-walkthrough.md) | **BIO 专题**：初始化链 + 导读注释 + 时序图（CLion 调试可选） |
 
 ```mermaid
 flowchart LR

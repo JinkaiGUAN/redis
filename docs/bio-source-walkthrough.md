@@ -531,7 +531,7 @@ bioCreateCloseJob(fd, 0, 0);       // 【导读】BIO worker0：close(fd) 真正
 
 ## 七、阶段 5：动手验证
 
-推荐优先用 **CLion 图形界面** 跟 BIO 调用链（线程、调用栈、变量一目了然）；命令行 gdb 作为备选。
+推荐优先用 **命令行** 完成验证（见 roadmap 1-A/1-B）。需要看线程/调用栈时再用 **lldb**（macOS）或可选 CLion；步骤与原因以 [rdb-aof-learning-roadmap.md 实验 1-C](rdb-aof-learning-roadmap.md) 为准。
 
 ### 7.1 编译与命令行启动（备选）
 
@@ -540,161 +540,75 @@ make CFLAGS="-g -O0"
 ./src/redis-server --appendonly yes --appendfsync everysec
 ```
 
-### 7.2 CLion 交互式调试（推荐）
+### 7.2 （可选）CLion / lldb 交互调试
 
-Redis 主工程是 **Makefile**，不是顶层 CMake。CLion 用「打开目录 + Makefile/Compilation Database + Custom Build Target」即可交互调试。
+> 完整逐步操作与**每步原因**见 roadmap **实验 1-C**。此处只列要点，避免与旧「断函数入口」流程冲突。
 
-#### 7.2.1 打开工程与索引源码
+#### 7.2.1–7.2.3 工程与 Run 配置
 
-1. **File → Open**，选择仓库根目录（含 `Makefile`、`src/`）。
-2. 若提示项目模型：选 **Makefile**，或沿用已有 `.idea`（本仓库可能已关联 CompDB）。
-3. 首次打开等索引完成；之后可在源码中搜索 `【导读】`、对函数名跳转定义。
+同前：Makefile 工程、`OPTIMIZATION=-O0 MALLOC=libc`、arguments 含 `--appendonly yes --appendfsync everysec`。macOS 调试器用 **LLDB**。
 
-生成 Compilation Database（改善跳转/补全，可选）：
+#### 7.2.4 断点怎么下（重要）
 
-```bash
-# 需已安装 bear，或用 compiledb 等工具
-make clean
-bear -- make CFLAGS="-g -O0" -j
-# 生成 compile_commands.json 后，CLion 可 File → Open 或 reload CompDB
-```
+| 该下 | 不该下 | 原因 |
+|------|--------|------|
+| `bioCreateFsyncJob` / `bioSubmitJob` | — | 证明主线程投递；看 `type=1`、`worker=1` |
+| `bio.c` 中 `BIO_AOF_FSYNC` 分支 **行断点**（约 `redis_fsync(job->fd_args.fd)` 那一行） | `bioProcessBackgroundJobs` **函数入口** | worker 早已在函数内 `while(1)`，入口不会再次命中 |
+| — | `b redis_fsync`（macOS） | 是宏不是函数 |
 
-也可只保证 Debug 编译（与仓库 External Tool 一致）：
-
-```bash
-make OPTIMIZATION=-O0 MALLOC=libc redis-server
-```
-
-产物：`src/redis-server`（带符号，可下断点）。
-
-#### 7.2.2 配置 Custom Build Target（一键编译）
-
-本仓库已有参考配置（可直接复用或对照新建）：
-
-- `.idea/customTargets.xml` → target 名 `redis-server-debug`
-- `.idea/tools/External Tools.xml` → `redis-build` / `redis-clean`
-
-当前 `redis-build` 等价命令：
-
-```bash
-make OPTIMIZATION=-O0 MALLOC=libc redis-server
-```
-
-（`OPTIMIZATION=-O0` 便于单步；`MALLOC=libc` 减少 jemalloc 干扰调试。）
-
-若需手建：
-
-1. **Settings → Tools → External Tools** → `+`
-   - Name：`redis-build`
-   - Program：`/usr/bin/make`（或 `make`）
-   - Arguments：`OPTIMIZATION=-O0 MALLOC=libc redis-server`
-   - Working directory：`$ProjectFileDir$`
-2. **Settings → Build, Execution, Deployment → Custom Build Targets** → `+`
-   - Name：`redis-server-debug`
-   - Build：选上面的 `redis-build`
-   - Clean：可选 `make distclean` / `redis-clean`
-
-#### 7.2.3 配置 Run/Debug Configuration
-
-1. 右上角 **Add Configuration…** → **Native Application**（或 **Custom Build Application**，若 Build 已绑 Custom Target）
-2. 建议字段：
-
-| 项 | 建议值 |
-|----|--------|
-| Name | `redis-server BIO` |
-| Target / Executable | `$ProjectFileDir$/src/redis-server` |
-| Program arguments | `--appendonly yes --appendfsync everysec --port 6379` |
-| Working directory | `$ProjectFileDir$` |
-| Before launch | Build `redis-server-debug`（或先手动 `make`） |
-
-可选：`--dir /tmp/redis-bio-debug`，避免污染仓库目录下的 dump/AOF。
-
-macOS 若 LLDB 附加受限：在 **System Settings → Privacy & Security → Developer Tools** 允许终端/CLion，或以调试签名运行（按本机策略）。
-
-#### 7.2.4 交互界面：断点与线程
-
-推荐断点（行号以本地为准，用符号搜索最快）：
-
-| 顺序 | 文件 | 符号 | 看什么 |
-|------|------|------|--------|
-| 1 | `bio.c` | `bioInit` | 三个 `pthread_create`，`job_comp_pipe` 注册到 `server.el` |
-| 2 | `aof.c` | `aof_background_fsync` | everysec 是否进 BIO |
-| 3 | `bio.c` | `bioCreateFsyncJob` | offset、fd |
-| 4 | `bio.c` | `bioSubmitJob` | `worker` 下标、入队后 `cond_signal` |
-| 5 | `bio.c` | `bioProcessBackgroundJobs` | 哪个 worker、是否 `BIO_AOF_FSYNC` |
-| 6 | `bio.c` | `bioPipeReadJobCompList` | 仅 completion 路径才会进（如 FLUSHALL ASYNC） |
-
-操作要点：
-
-1. 源码行号左侧点击红色断点（或光标处 `⌘F8` / `Ctrl+F8`）。
-2. 点绿色虫子图标 **Debug**（不要只 Run）。
-3. 进程停在 `bioInit` 后，打开：
-   - **Debugger → Frames**：调用栈（谁调用了当前函数）
-   - **Threads**：主线程 vs `bio_aof` / `bio_close_file` / `bio_lazy_free`
-   - **Variables**：`worker`、`job`、`type` 等
-4. **F8** Step Over、**F7** Step Into、**⇧F8** Step Out；Resume（`⌥⌘R` / `F9`）继续跑到下一断点。
-5. 另开终端触发路径（Debug 时 Redis 已在跑）：
-
-```bash
-./src/redis-cli -p 6379 SET foo bar
-# 或加压更容易在 1s 窗口内撞到 fsync：
-./src/redis-benchmark -p 6379 -t set -n 1000 -q
-```
+流程摘要：先看生产者 → **disable** Create/Submit → 只留行断点 → `c` + 再压测 → `thread list` 确认非主线程。
 
 #### 7.2.5 跟 BIO 时建议观察的界面
 
 ```mermaid
 flowchart LR
-  subgraph clion [CLion_Debug窗口]
+  subgraph clion [Debug窗口]
     bp[断点列表]
     frames[Frames调用栈]
     threads[Threads线程列表]
-    vars[Variables]
   end
   subgraph flow [跟读顺序]
-    init[bioInit]
+    create[bioCreateFsyncJob]
     submit[bioSubmitJob]
-    worker[bioProcessBackgroundJobs]
+    line[bio.c_AOF_FSYNC行]
   end
-  bp --> init --> submit --> worker
-  threads -->|"切换到 bio_aof"| worker
-  frames -->|"确认主线程提交"| submit
+  bp --> create --> submit --> line
+  threads -->|"非主线程"| line
+  frames -->|"主线程 aeMain"| submit
 ```
 
-| 界面 | 用法 |
-|------|------|
-| **Threads** | 停在 `bioProcessBackgroundJobs` 时切到 `bio_aof` 线程，确认 fsync 不在主线程 |
-| **Frames** | 在 `bioSubmitJob` 上看上层是否 `aof_background_fsync` ← `flushAppendOnlyFile` ← `beforeSleep` |
-| **Variables / Watches** | 监视 `bio_jobs_counter`、`job->header.type`、`server.aof_fsync` |
-| **LLDB/GDB console** | Debug 窗口下方可敲 `p worker`、`p *job` 等（视工具链） |
+#### 7.2.6 lldb 与 gdb 对照
 
-**注意**：`bioProcessBackgroundJobs` 是死循环，第一次进入可能停在 `cond_wait`；应用写入触发 fsync 后，再 Resume 或在 `redis_fsync`/`BIO_AOF_FSYNC` 分支处下断，避免一直卡在等待。
+| 意图 | lldb（macOS） | gdb |
+|------|---------------|-----|
+| 启动 | `lldb -- ./src/redis-server ...` | `gdb --args ./src/redis-server ...` |
+| 符号断点 | `b bioSubmitJob` | `break bioSubmitJob` |
+| 行断点 | `b bio.c:323` | `break bio.c:323` |
+| 继续 | `c` | `c` |
+| 线程列表 | `thread list` | `info threads` |
+| 调用栈 | `bt` | `bt` |
+| 关断点 | `breakpoint disable N` | `disable N` |
 
-#### 7.2.6 与命令行 gdb 的对应关系
+### 7.3 lldb 最短命令序列（与 roadmap 1-C 一致）
 
-| CLion | gdb 等价 |
-|-------|----------|
-| 行断点 | `break bioSubmitJob` |
-| Debug 启动 | `gdb --args ./src/redis-server ...` + `run` |
-| Threads 面板 | `info threads` / `thread N` |
-| Frames | `bt` |
-| Variables | `p var` |
-| Resume / Step | `c` / `n` / `s` |
-
-只会命令行时可看下一小节；日常学 BIO **优先 CLion**。
-
-### 7.3 gdb 推荐断点顺序（命令行备选）
-
-```gdb
-break bioInit
-break bioCreateFsyncJob
-break bioSubmitJob
-break bioProcessBackgroundJobs
-break bioPipeReadJobCompList
-run
+```bash
+lldb -- ./src/redis-server --port 6379 --dir /tmp/redis-lab1 \
+  --appendonly yes --appendfsync everysec
 ```
 
-在另一个终端：`redis-cli SET foo bar` 或 `redis-benchmark -t set -n 1000 -q`
+```text
+(lldb) b bioCreateFsyncJob
+(lldb) b bioSubmitJob
+(lldb) b bio.c:323
+(lldb) run
+# 另终端 benchmark → 停在 Submit 时: p type / 单步后 p worker
+(lldb) breakpoint disable 1
+(lldb) breakpoint disable 2
+(lldb) c
+# 再 benchmark → 停在 bio.c:323 时: thread list / bt
+```
+
+行号 `323` 请用编辑器搜索 `BIO_AOF_FSYNC` 核对。
 
 ### 7.4 每遍阅读的自检问题
 
@@ -707,7 +621,7 @@ run
 | 第 5 遍 | Rewrite 前为何 drain？ | 等旧 AOF 的 fsync 全部完成，防 repl offset 竞态 |
 | 第 6 遍 | AOF 与主线程如何关联？ | `aeMain → beforeSleep → flushAppendOnlyFile`（见 FAQ Q1） |
 | 第 7 遍 | Submit 为何不限队列深度？ | 无界 list；反压在调用方（见 FAQ Q4） |
-| 第 8 遍 | CLion 里如何确认 fsync 在 BIO？ | Threads 切到 `bio_aof`，Frames 不在主线程 `aeMain` |
+| 第 8 遍 | 如何确认 fsync 在 BIO？ | 对 `bio.c` AOF_FSYNC **行断点**命中后 `thread list` 非主线程（见 roadmap 1-C） |
 
 ---
 
