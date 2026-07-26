@@ -14,6 +14,7 @@
 | **2** | [rdb-aof-5w2h-analysis.md](rdb-aof-5w2h-analysis.md) | 从 Why/What/When/Where/Who/Whom/How 分析设计决策 |
 | **3** | [rdb-aof-learning-roadmap.md](rdb-aof-learning-roadmap.md) | 分阶段走读 + 命令行实验；**阶段 1 含固化短答与细节** |
 | **3b** | [bio-source-walkthrough.md](bio-source-walkthrough.md) | **BIO 专题**：初始化链 + 导读注释 + 时序图（CLion 调试可选） |
+| **3c** | [week3-day7-bio-queue-pthread.md](week3-day7-bio-queue-pthread.md) | **pthread Week3 Day7**：submit/worker/`while` 等价、对标本地 Demo、`io_threads_mutex`；**含逐步实验 D7-0～G** |
 
 ```mermaid
 flowchart LR
@@ -23,8 +24,9 @@ flowchart LR
     analysis["02 5W2H分析\n设计理解"]
     roadmap["03 学习路线\n源码实践"]
     bio["03b BIO导读\n注释+关系图"]
+    day7["03c Week3 Day7\n队列对标 pthread"]
 
-    intro --> pthread --> guide --> analysis --> roadmap --> bio
+    intro --> pthread --> guide --> analysis --> roadmap --> bio --> day7
 ```
 
 ---
@@ -48,6 +50,8 @@ flowchart LR
 | 主题 | 文件 |
 |------|------|
 | BIO 线程 | [src/bio.c](../src/bio.c) |
+| BIO ↔ pthread 生产消费（Day7） | [week3-day7-bio-queue-pthread.md](week3-day7-bio-queue-pthread.md) |
+| I/O threads mutex | [src/networking.c](../src/networking.c)（Threaded I/O 一节） |
 | RDB 后台保存 | [src/rdb.c](../src/rdb.c) |
 | AOF 写入与 Rewrite | [src/aof.c](../src/aof.c) |
 | fork 与子进程回收 | [src/server.c](../src/server.c) |
